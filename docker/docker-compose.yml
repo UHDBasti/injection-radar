@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # ==========================================================================
+  # PostgreSQL Datenbank
+  # ==========================================================================
+  db:
+    image: postgres:16-alpine
+    container_name: pishield-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pishield
+      POSTGRES_USER: pishield
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pishield"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pishield-network
+
+  # ==========================================================================
+  # Hauptsystem (Orchestrator)
+  # ==========================================================================
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.orchestrator
+    container_name: pishield-orchestrator
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://pishield:${DB_PASSWORD:-changeme}@db:5432/pishield
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    volumes:
+      - ../config:/app/config:ro
+      - ../data:/app/data:ro
+      - logs:/app/logs
+    ports:
+      - "8000:8000"
+    networks:
+      - pishield-network
+
+  # ==========================================================================
+  # Scraper Sandbox Pool (Template für Scaling)
+  # ==========================================================================
+  scraper:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.scraper
+    # Wird über docker-compose scale gesteuert
+    deploy:
+      replicas: 2  # Start mit 2, max 10
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://pishield:${DB_PASSWORD:-changeme}@db:5432/pishield
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    # Kein Zugriff auf Host-Filesystem (Isolation)
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - pishield-network
+
+  # ==========================================================================
+  # Redis (für Job Queue)
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    container_name: pishield-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - pishield-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  logs:
+
+networks:
+  pishield-network:
+    driver: bridge
