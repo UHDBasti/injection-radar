@@ -37,7 +37,9 @@ class TestDatabaseConfig:
         assert config.name == "pishield"
 
     def test_url_generation(self):
+        # Test PostgreSQL URL
         config = DatabaseConfig(
+            type="postgresql",
             host="db.example.com",
             port=5433,
             name="testdb",
@@ -49,6 +51,13 @@ class TestDatabaseConfig:
         assert "testuser:secret" in url
         assert "db.example.com:5433" in url
         assert "/testdb" in url
+
+    def test_sqlite_url_generation(self):
+        # Test SQLite URL (default)
+        config = DatabaseConfig(type="sqlite", sqlite_path="test.db")
+        url = config.url
+        assert "sqlite:///" in url
+        assert "test.db" in url
 
 
 class TestScrapingConfig:
