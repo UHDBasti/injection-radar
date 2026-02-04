@@ -250,7 +250,43 @@ else
 fi
 
 # ============================================================================
-# 9. Abschluss
+# 9. Globale Installation (~/bin)
+# ============================================================================
+log_info "Erstelle globalen CLI-Befehl..."
+
+# Erstelle Wrapper-Script falls nicht vorhanden
+if [ ! -f "$SCRIPT_DIR/injection-radar" ] || [ ! -x "$SCRIPT_DIR/injection-radar" ]; then
+    cat > "$SCRIPT_DIR/injection-radar" << 'WRAPPEREOF'
+#!/bin/bash
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/.venv/bin/activate"
+exec injection-radar "$@"
+WRAPPEREOF
+    chmod +x "$SCRIPT_DIR/injection-radar"
+fi
+
+# Erstelle ~/bin und Symlink
+mkdir -p "$HOME/bin"
+ln -sf "$SCRIPT_DIR/injection-radar" "$HOME/bin/injection-radar"
+
+# Füge ~/bin zum PATH hinzu wenn nötig
+if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+    # Für bash
+    if [ -f "$HOME/.bashrc" ]; then
+        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
+    fi
+    # Für zsh
+    if [ -f "$HOME/.zshrc" ]; then
+        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.zshrc"
+    fi
+    export PATH="$HOME/bin:$PATH"
+    log_success "~/bin zum PATH hinzugefügt"
+fi
+
+log_success "CLI global verfügbar: injection-radar"
+
+# ============================================================================
+# 10. Abschluss
 # ============================================================================
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
@@ -258,21 +294,11 @@ echo -e "${GREEN}║${NC}              ${GREEN}Installation abgeschlossen!${NC} 
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-echo -e "${BLUE}Nächste Schritte:${NC}"
+echo -e "${BLUE}Starte jetzt InjectionRadar:${NC}"
 echo ""
-echo "  1. Aktiviere das Virtual Environment:"
-echo -e "     ${YELLOW}source .venv/bin/activate${NC}"
+echo -e "     ${YELLOW}injection-radar${NC}"
 echo ""
-echo "  2. Füge deinen API Key hinzu:"
-echo -e "     ${YELLOW}echo 'ANTHROPIC_API_KEY=sk-ant-...' >> .env${NC}"
-echo "     oder"
-echo -e "     ${YELLOW}export ANTHROPIC_API_KEY='sk-ant-...'${NC}"
-echo ""
-echo "  3. Starte einen Scan:"
-echo -e "     ${YELLOW}injection-radar scan https://example.com${NC}"
-echo ""
-echo "  4. Oder starte die API:"
-echo -e "     ${YELLOW}uvicorn src.api.main:app --reload${NC}"
+echo -e "${DIM}(Falls 'command not found': source ~/.bashrc)${NC}"
 echo ""
 
 # Teste Installation
@@ -287,3 +313,5 @@ fi
 
 echo ""
 log_success "InjectionRadar ist bereit!"
+echo ""
+echo -e "${YELLOW}Starte mit:  injection-radar${NC}"

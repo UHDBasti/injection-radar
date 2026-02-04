@@ -1,0 +1,19 @@
+#!/bin/bash
+#
+# InjectionRadar CLI Wrapper
+# Aktiviert automatisch das venv und startet das CLI
+#
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/.venv"
+
+# Prüfe ob venv existiert
+if [ ! -d "$VENV_DIR" ]; then
+    echo "Fehler: Virtual Environment nicht gefunden."
+    echo "Bitte führe zuerst aus: cd $SCRIPT_DIR && ./install.sh"
+    exit 1
+fi
+
+# Aktiviere venv und starte CLI
+source "$VENV_DIR/bin/activate"
+exec injection-radar "$@"
