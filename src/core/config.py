@@ -41,6 +41,25 @@ class DatabaseConfig(BaseSettings):
     pool_size: int = 10
     max_overflow: int = 20
 
+    def __init__(self, **data):
+        """Liest Umgebungsvariablen manuell (pydantic-settings Bug bei nested models)."""
+        # Umgebungsvariablen mit Prefix PISHIELD_DB_ laden
+        env_mapping = {
+            "PISHIELD_DB_TYPE": "type",
+            "PISHIELD_DB_HOST": "host",
+            "PISHIELD_DB_PORT": "port",
+            "PISHIELD_DB_NAME": "name",
+            "PISHIELD_DB_USER": "user",
+            "PISHIELD_DB_PASSWORD": "password",
+        }
+        for env_key, field_name in env_mapping.items():
+            if env_key in os.environ and field_name not in data:
+                value = os.environ[env_key]
+                if field_name == "port":
+                    value = int(value)
+                data[field_name] = value
+        super().__init__(**data)
+
     @property
     def url(self) -> str:
         """Generiert die Datenbank-URL."""
@@ -93,6 +112,20 @@ class RedisConfig(BaseSettings):
 
     host: str = "localhost"
     port: int = 6379
+
+    def __init__(self, **data):
+        """Liest Umgebungsvariablen manuell."""
+        env_mapping = {
+            "REDIS_HOST": "host",
+            "REDIS_PORT": "port",
+        }
+        for env_key, field_name in env_mapping.items():
+            if env_key in os.environ and field_name not in data:
+                value = os.environ[env_key]
+                if field_name == "port":
+                    value = int(value)
+                data[field_name] = value
+        super().__init__(**data)
     db: int = 0
     password: Optional[str] = None
 

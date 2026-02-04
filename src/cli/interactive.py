@@ -245,9 +245,12 @@ def show_help():
 
 | Befehl | Beschreibung |
 |--------|--------------|
-| `scan <url>` | Scannt eine URL (automatisch bester Modus) |
+| `scan <url>` | Scannt eine URL |
+| `scan <url1> <url2> ...` | Scannt mehrere URLs parallel (max 10) |
+| `scan list <file.csv>` | Scannt URLs aus einer CSV-Datei |
 | `scan <url> --local` | Lokaler Scan ohne Docker |
 | `scan <url> --quick` | Schneller Scan ohne LLM |
+| `history [n]` | Zeigt die letzten n Scans (Standard: 20) |
 | `status` | Zeigt den aktuellen Status |
 | `services` | Zeigt Docker-Service-Status |
 | `restart` | Startet alle Services neu |
@@ -365,6 +368,110 @@ def show_logs(show_path: bool = False):
         except json.JSONDecodeError:
             # Falls kein JSON, zeige Zeile direkt
             console.print(f"[dim]{line.strip()}[/dim]")
+
+
+async def show_history(config: dict, limit: int = 20):
+    """Zeigt die Scan-History aus der Datenbank an."""
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        URLDB,
+        DomainDB,
+        ScrapedContentDB,
+        AnalysisResultDB,
+    )
+    from sqlalchemy import select, func, desc
+    from sqlalchemy.orm import selectinload
+
+    settings = get_settings()
+
+    console.print("\n[bold]Scan-History[/bold]\n")
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            # Hole URLs mit zugehörigen ScrapedContent und Domain
+            result = await session.execute(
+                select(ScrapedContentDB)
+                .options(selectinload(ScrapedContentDB.url).selectinload(URLDB.domain))
+                .order_by(desc(ScrapedContentDB.scraped_at))
+                .limit(limit)
+            )
+            scraped_items = result.scalars().all()
+
+            if not scraped_items:
+                console.print("[dim]Noch keine Scans durchgeführt.[/dim]")
+                console.print("[dim]Starte mit: scan <url>[/dim]")
+                return
+
+            # Tabelle erstellen
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("#", style="dim", width=4)
+            table.add_column("URL", max_width=40)
+            table.add_column("Status", width=10)
+            table.add_column("Wörter", justify="right", width=8)
+            table.add_column("HTTP", width=5)
+            table.add_column("Gescannt", width=16)
+
+            status_colors = {
+                "safe": "green",
+                "suspicious": "yellow",
+                "dangerous": "red",
+                "error": "orange1",
+                "pending": "dim",
+            }
+
+            for i, item in enumerate(scraped_items, 1):
+                url_obj = item.url
+                domain = url_obj.domain.domain if url_obj.domain else "-"
+
+                # URL kürzen
+                display_url = url_obj.url
+                if len(display_url) > 38:
+                    display_url = display_url[:35] + "..."
+
+                # Status mit Farbe
+                status = url_obj.current_status.value if url_obj.current_status else "pending"
+                color = status_colors.get(status, "white")
+                status_display = f"[{color}]{status}[/{color}]"
+
+                # HTTP Status mit Farbe
+                http = str(item.http_status)
+                if item.http_status >= 400:
+                    http = f"[red]{http}[/red]"
+                elif item.http_status >= 300:
+                    http = f"[yellow]{http}[/yellow]"
+                else:
+                    http = f"[green]{http}[/green]"
+
+                # Zeit formatieren
+                scan_time = item.scraped_at.strftime("%Y-%m-%d %H:%M")
+
+                table.add_row(
+                    str(i),
+                    display_url,
+                    status_display,
+                    f"{item.word_count:,}",
+                    http,
+                    scan_time,
+                )
+
+            console.print(table)
+
+            # Statistiken
+            total_scans = await session.scalar(select(func.count(ScrapedContentDB.id)))
+            total_domains = await session.scalar(select(func.count(DomainDB.id)))
+
+            console.print(f"\n[dim]Gesamt: {total_scans} Scans, {total_domains} Domains[/dim]")
+            console.print(f"[dim]Zeige die letzten {min(limit, len(scraped_items))} Einträge[/dim]")
+
+    except Exception as e:
+        log_error_with_trace("history_error", e)
+        console.print(f"[red]Fehler beim Laden der History: {e}[/red]")
+        console.print("[dim]Ist die Datenbank erreichbar?[/dim]")
 
 
 async def do_scan_via_api(url: str, config: dict):
@@ -713,6 +820,206 @@ async def do_scan(url: str, config: dict, quick: bool = False, local: bool = Fal
             await do_scan_local(url, config, quick)
 
 
+def load_urls_from_csv(file_path: str) -> list[str]:
+    """Lädt URLs aus einer CSV-Datei.
+
+    Unterstützt verschiedene Formate:
+    - Einfache Liste (eine URL pro Zeile)
+    - CSV mit Header (sucht nach 'url' oder 'domain' Spalte)
+    - Tranco-Format (rank,domain)
+
+    Args:
+        file_path: Pfad zur CSV-Datei
+
+    Returns:
+        Liste von URLs
+    """
+    import csv
+    from pathlib import Path
+
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Datei nicht gefunden: {file_path}")
+
+    urls = []
+
+    with open(path, newline='', encoding='utf-8') as f:
+        # Erste Zeile lesen um Format zu erkennen
+        first_line = f.readline().strip()
+        f.seek(0)
+
+        # Prüfe ob es ein Header ist
+        first_lower = first_line.lower()
+
+        if ',' in first_line:
+            # CSV mit Komma
+            reader = csv.reader(f)
+            header = next(reader, None)
+
+            if header:
+                # Finde URL oder Domain Spalte
+                header_lower = [h.lower() for h in header]
+
+                url_col = None
+                if 'url' in header_lower:
+                    url_col = header_lower.index('url')
+                elif 'domain' in header_lower:
+                    url_col = header_lower.index('domain')
+                elif len(header) == 2 and header[0].isdigit():
+                    # Tranco-Format: rank,domain
+                    url_col = 1
+                else:
+                    # Erste Spalte nehmen
+                    url_col = 0
+
+                for row in reader:
+                    if row and len(row) > url_col:
+                        value = row[url_col].strip()
+                        if value and not value.lower().startswith('url'):
+                            # Normalisiere zu URL
+                            if not value.startswith(('http://', 'https://')):
+                                value = 'https://' + value
+                            urls.append(value)
+        else:
+            # Einfache Liste
+            for line in f:
+                value = line.strip()
+                if value and not value.lower().startswith('url'):
+                    if not value.startswith(('http://', 'https://')):
+                        value = 'https://' + value
+                    urls.append(value)
+
+    return urls
+
+
+async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 10):
+    """Scannt mehrere URLs parallel.
+
+    Args:
+        urls: Liste der zu scannenden URLs
+        config: Konfiguration
+        max_concurrent: Maximale Anzahl gleichzeitiger Scans (Default: 10)
+    """
+    import httpx
+    from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn
+
+    if not urls:
+        console.print("[yellow]Keine URLs zum Scannen.[/yellow]")
+        return
+
+    # Begrenze auf max_concurrent
+    if len(urls) > max_concurrent:
+        console.print(f"[yellow]Hinweis: Limitiere auf {max_concurrent} parallele Scans[/yellow]")
+
+    api_url = config.get("orchestrator_url", "http://localhost:8000")
+    results = []
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def scan_one(url: str, progress: Progress, task_id: TaskID) -> dict:
+        """Scannt eine einzelne URL mit Semaphore."""
+        async with semaphore:
+            try:
+                async with httpx.AsyncClient(timeout=180) as client:
+                    response = await client.post(
+                        f"{api_url}/scan",
+                        json={"url": url, "task": "summarize"},
+                    )
+                    if response.status_code == 200:
+                        result = response.json()
+                        result["url"] = url
+                        result["success"] = True
+                    else:
+                        result = {"url": url, "success": False, "error": response.text}
+            except Exception as e:
+                result = {"url": url, "success": False, "error": str(e)}
+
+            progress.update(task_id, advance=1)
+            return result
+
+    # Prüfe API-Verfügbarkeit
+    try:
+        async with httpx.AsyncClient(timeout=2) as client:
+            await client.get(f"{api_url}/health")
+    except Exception:
+        console.print("[red]Orchestrator nicht erreichbar![/red]")
+        console.print("[dim]Starte mit: docker compose up -d[/dim]")
+        return
+
+    console.print(f"\n[bold]Starte parallelen Scan von {len(urls)} URLs[/bold]")
+    console.print(f"[dim]Max. parallel: {max_concurrent}[/dim]\n")
+
+    with Progress(
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TextColumn("({task.completed}/{task.total})"),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("Scanne URLs...", total=len(urls))
+
+        # Alle Scans parallel starten
+        tasks = [scan_one(url, progress, task_id) for url in urls]
+        results = await asyncio.gather(*tasks)
+
+    # Ergebnisse zusammenfassen
+    success_count = sum(1 for r in results if r.get("success"))
+    failed_count = len(results) - success_count
+
+    console.print(f"\n[bold]Ergebnis: {success_count} erfolgreich, {failed_count} fehlgeschlagen[/bold]\n")
+
+    # Tabelle mit Ergebnissen
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("URL", max_width=40)
+    table.add_column("Status", width=12)
+    table.add_column("Severity", justify="right", width=8)
+    table.add_column("Flags", justify="right", width=6)
+
+    status_colors = {
+        "safe": "green",
+        "suspicious": "yellow",
+        "dangerous": "red",
+    }
+
+    for result in results:
+        url = result["url"]
+        if len(url) > 38:
+            url = url[:35] + "..."
+
+        if result.get("success"):
+            classification = result.get("classification", "unknown")
+            color = status_colors.get(classification, "white")
+            severity = result.get("severity_score", 0) or 0
+            flags_list = result.get("flags") or []
+            flags_count = len(flags_list)
+
+            table.add_row(
+                url,
+                f"[{color}]{classification}[/{color}]",
+                f"{severity:.1f}",
+                str(flags_count),
+            )
+        else:
+            error = result.get("error", "Unknown error")[:30]
+            table.add_row(
+                url,
+                "[red]error[/red]",
+                "-",
+                f"[dim]{error}[/dim]",
+            )
+
+    console.print(table)
+
+    # Gefährliche URLs hervorheben
+    dangerous = [r for r in results if r.get("success") and r.get("classification") == "dangerous"]
+    if dangerous:
+        console.print(f"\n[bold red]⚠ {len(dangerous)} gefährliche URL(s) gefunden:[/bold red]")
+        for r in dangerous:
+            console.print(f"  • {r['url']}")
+
+    return results
+
+
 def interactive_shell():
     """Startet die interaktive Shell mit automatischem Service-Start."""
     log_info("interactive_shell_started")
@@ -782,25 +1089,71 @@ def interactive_shell():
 
                 elif command == "scan":
                     if not args:
-                        console.print("[red]Bitte gib eine URL an: scan <url>[/red]")
+                        console.print("[red]Bitte gib eine URL an: scan <url> [url2] [url3] ...[/red]")
+                        console.print("[dim]Oder: scan list <file.csv>[/dim]")
                         continue
-
-                    url = args[0]
-                    if not url.startswith(("http://", "https://")):
-                        url = "https://" + url
 
                     quick = "--quick" in args or "-q" in args
                     local = "--local" in args or "-l" in args
 
-                    # Nutze den persistenten Event Loop
-                    loop.run_until_complete(do_scan(url, config, quick, local))
+                    # Spezialfall: scan list <file>
+                    if args[0] == "list":
+                        if len(args) < 2:
+                            console.print("[red]Bitte gib eine CSV-Datei an: scan list <file.csv>[/red]")
+                            continue
+
+                        file_path = args[1]
+                        try:
+                            urls = load_urls_from_csv(file_path)
+                            console.print(f"[green]✓[/green] {len(urls)} URLs aus {file_path} geladen")
+
+                            if not urls:
+                                console.print("[yellow]Keine URLs in der Datei gefunden.[/yellow]")
+                                continue
+
+                            # Limit anzeigen
+                            limit = 10
+                            if len(urls) > limit:
+                                console.print(f"[yellow]Hinweis: Scanne nur die ersten {limit} URLs[/yellow]")
+                                console.print(f"[dim]Für mehr URLs: Teile die Datei auf oder erhöhe das Limit[/dim]")
+                                urls = urls[:limit]
+
+                            loop.run_until_complete(do_scan_multiple(urls, config))
+                        except FileNotFoundError as e:
+                            console.print(f"[red]{e}[/red]")
+                        except Exception as e:
+                            console.print(f"[red]Fehler beim Laden der CSV: {e}[/red]")
+                        continue
+
+                    # URLs extrahieren (alle Args die keine Flags sind)
+                    urls = [a for a in args if not a.startswith("-")]
+
+                    # URLs normalisieren
+                    normalized_urls = []
+                    for url in urls:
+                        if not url.startswith(("http://", "https://")):
+                            url = "https://" + url
+                        normalized_urls.append(url)
+
+                    if len(normalized_urls) == 1:
+                        # Einzelner Scan
+                        loop.run_until_complete(do_scan(normalized_urls[0], config, quick, local))
+                    else:
+                        # Paralleler Scan
+                        if local:
+                            console.print("[yellow]Paralleler Scan nur via API möglich[/yellow]")
+                            continue
+                        loop.run_until_complete(do_scan_multiple(normalized_urls, config))
 
                 elif command == "logs":
                     show_path = "-f" in args or "--file" in args
                     show_logs(show_path)
 
                 elif command == "history":
-                    console.print("[dim]History-Feature kommt bald...[/dim]")
+                    limit = 20
+                    if args and args[0].isdigit():
+                        limit = int(args[0])
+                    loop.run_until_complete(show_history(config, limit))
 
                 elif command == "services":
                     show_services_status()

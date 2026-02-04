@@ -29,9 +29,11 @@ from ..core.models import ScrapedContent, ScanResult, RedFlag, RedFlagType, Seve
 from ..core.database import (
     ScrapedContentDB,
     URLDB,
+    DomainDB,
     get_async_engine,
     get_async_session_factory,
 )
+from sqlalchemy import select
 from ..core.queue import JobQueue, QueueConfig, ScanJob, JobResult
 from ..core.logging import log_info, log_error, log_warning, log_debug, log_error_with_trace
 from ..llm import AnthropicClient, OpenAIClient, LLMResult, DUMMY_TOOLS
@@ -44,6 +46,47 @@ from ..analysis.detector import RedFlagDetector
 
 # Graceful shutdown flag
 _shutdown_requested = False
+
+
+async def get_or_create_url(session: AsyncSession, url: str) -> int:
+    """Holt oder erstellt einen URL-Eintrag in der Datenbank.
+
+    Returns:
+        Die ID der URL in der Datenbank.
+    """
+    # Zuerst versuchen, existierende URL zu finden
+    result = await session.execute(
+        select(URLDB).where(URLDB.url == url)
+    )
+    existing_url = result.scalar_one_or_none()
+
+    if existing_url:
+        return existing_url.id
+
+    # Domain extrahieren
+    parsed = urlparse(url)
+    domain_name = parsed.netloc
+
+    # Domain holen oder erstellen
+    domain_result = await session.execute(
+        select(DomainDB).where(DomainDB.domain == domain_name)
+    )
+    domain = domain_result.scalar_one_or_none()
+
+    if not domain:
+        domain = DomainDB(domain=domain_name)
+        session.add(domain)
+        await session.flush()  # Um domain.id zu bekommen
+
+    # URL erstellen
+    url_record = URLDB(
+        url=url,
+        domain_id=domain.id,
+    )
+    session.add(url_record)
+    await session.flush()  # Um url_record.id zu bekommen
+
+    return url_record.id
 
 
 class ScraperWorker:
@@ -126,7 +169,7 @@ class ScraperWorker:
 
             return ScrapedContent(
                 url_id=0,  # Wird später gesetzt
-                scraped_at=datetime.now(timezone.utc),
+                scraped_at=datetime.utcnow(),  # Naive datetime für DB
                 server_ip=server_ip,
                 http_status=response.status,
                 response_time_ms=response_time_ms,
@@ -379,8 +422,11 @@ async def worker_main():
                     # 2. Rohdaten in Datenbank speichern (nur Subsystem sieht das!)
                     # =========================================================
                     async with SessionFactory() as session:
+                        # URL in DB anlegen oder holen
+                        url_id = await get_or_create_url(session, job.url)
+
                         content_db = ScrapedContentDB(
-                            url_id=0,  # Kein FK in dieser Architektur
+                            url_id=url_id,
                             scraped_at=content.scraped_at,
                             server_ip=content.server_ip,
                             http_status=content.http_status,
@@ -397,7 +443,7 @@ async def worker_main():
                         )
                         session.add(content_db)
                         await session.commit()
-                        log_debug("scraped_content_saved", job_id=job.job_id)
+                        log_debug("scraped_content_saved", job_id=job.job_id, url_id=url_id)
 
                     # =========================================================
                     # 3. LLM-Test durchführen

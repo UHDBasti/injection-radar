@@ -517,6 +517,100 @@ async def get_queue_stats():
         raise HTTPException(status_code=500, detail=f"Queue error: {str(e)}")
 
 
+@app.get("/history")
+async def get_history(
+    limit: int = Query(20, ge=1, le=100, description="Anzahl der Einträge"),
+):
+    """Gibt die letzten Scan-Ergebnisse zurück (für MCP Server)."""
+    from ..core.database import ScrapedContentDB
+    from sqlalchemy.orm import selectinload
+
+    async with SessionFactory() as session:
+        result = await session.execute(
+            select(ScrapedContentDB)
+            .options(selectinload(ScrapedContentDB.url))
+            .order_by(ScrapedContentDB.scraped_at.desc())
+            .limit(limit)
+        )
+        items = result.scalars().all()
+
+        return {
+            "history": [
+                {
+                    "url": item.url.url if item.url else "unknown",
+                    "status": item.url.current_status.value if item.url else "unknown",
+                    "http_status": item.http_status,
+                    "word_count": item.word_count,
+                    "scanned_at": item.scraped_at.isoformat(),
+                }
+                for item in items
+            ],
+            "total": len(items),
+        }
+
+
+@app.get("/url/status")
+async def check_url_status(
+    url: str = Query(..., description="Die zu prüfende URL"),
+):
+    """Prüft ob eine URL bereits gescannt wurde (für MCP Server)."""
+    async with SessionFactory() as session:
+        url_db = await session.scalar(
+            select(URLDB).where(URLDB.url == url)
+        )
+
+        if not url_db:
+            raise HTTPException(status_code=404, detail="URL not found in database")
+
+        # Letzte Analyse holen
+        analysis = await session.scalar(
+            select(AnalysisResultDB)
+            .where(AnalysisResultDB.url_id == url_db.id)
+            .order_by(AnalysisResultDB.analyzed_at.desc())
+        )
+
+        return {
+            "url": url,
+            "status": url_db.current_status.value,
+            "confidence": url_db.current_confidence,
+            "scan_count": url_db.scan_count,
+            "first_scanned": url_db.first_scanned.isoformat() if url_db.first_scanned else None,
+            "last_scanned": url_db.last_scanned.isoformat() if url_db.last_scanned else None,
+            "severity_score": analysis.severity_score if analysis else None,
+            "flags_count": len(analysis.flags_triggered) if analysis else 0,
+        }
+
+
+@app.get("/domains/dangerous")
+async def get_dangerous_domains(
+    limit: int = Query(20, ge=1, le=100, description="Anzahl der Einträge"),
+):
+    """Listet Domains mit gefährlichen URLs (für MCP Server)."""
+    async with SessionFactory() as session:
+        result = await session.execute(
+            select(DomainDB)
+            .where(DomainDB.dangerous_urls_count > 0)
+            .order_by(DomainDB.risk_score.desc())
+            .limit(limit)
+        )
+        domains = result.scalars().all()
+
+        return {
+            "dangerous_domains": [
+                {
+                    "domain": d.domain,
+                    "dangerous_count": d.dangerous_urls_count,
+                    "suspicious_count": d.suspicious_urls_count,
+                    "total_scanned": d.total_urls_scanned,
+                    "risk_score": d.risk_score,
+                    "first_seen": d.first_seen.isoformat(),
+                }
+                for d in domains
+            ],
+            "total": len(domains),
+        }
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================

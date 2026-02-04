@@ -69,9 +69,9 @@ class URLDB(Base):
     url = Column(Text, unique=True, nullable=False)
     domain_id = Column(Integer, ForeignKey("domains.id"), nullable=True, index=True)
 
-    # Status
+    # Status (values_callable damit .value statt Name verwendet wird)
     current_status = Column(
-        Enum(Classification, name="classification_enum"),
+        Enum(Classification, name="classification_enum", values_callable=lambda x: [e.value for e in x]),
         default=Classification.PENDING,
         nullable=False,
     )
@@ -243,9 +243,9 @@ class AnalysisResultDB(Base):
         Integer, ForeignKey("scan_results.id"), unique=True, nullable=False
     )
 
-    # Klassifizierung
+    # Klassifizierung (values_callable damit .value statt Name verwendet wird)
     classification = Column(
-        Enum(Classification, name="classification_enum"),
+        Enum(Classification, name="classification_enum", values_callable=lambda x: [e.value for e in x]),
         nullable=False,
     )
     confidence = Column(Float, nullable=False)

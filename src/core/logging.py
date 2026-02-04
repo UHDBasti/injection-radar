@@ -12,12 +12,27 @@ from typing import Optional
 
 import structlog
 
-# Log-Verzeichnis
-LOG_DIR = Path.home() / ".injection-radar" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+# Log-Verzeichnis (mit Fallback für read-only Container)
+def _get_log_dir() -> Path:
+    """Ermittelt das Log-Verzeichnis mit Fallback."""
+    primary = Path.home() / ".injection-radar" / "logs"
+    try:
+        primary.mkdir(parents=True, exist_ok=True)
+        return primary
+    except (OSError, PermissionError):
+        # Fallback für read-only Container: /tmp
+        fallback = Path("/tmp/injection-radar-logs")
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        except (OSError, PermissionError):
+            # Letzter Fallback: kein File-Logging
+            return None
+
+LOG_DIR = _get_log_dir()
 
 # Aktuelles Log-File (nach Datum)
-CURRENT_LOG = LOG_DIR / f"injection-radar-{datetime.now().strftime('%Y-%m-%d')}.log"
+CURRENT_LOG = (LOG_DIR / f"injection-radar-{datetime.now().strftime('%Y-%m-%d')}.log") if LOG_DIR else None
 
 
 def setup_logging(
@@ -37,14 +52,23 @@ def setup_logging(
     """
     log_file = log_file or CURRENT_LOG
 
+    # Handler konfigurieren
+    handlers = []
+    if log_file:
+        try:
+            handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        except (OSError, PermissionError):
+            pass  # Kein File-Logging möglich
+    if verbose:
+        handlers.append(logging.StreamHandler(sys.stderr))
+    if not handlers:
+        handlers.append(logging.NullHandler())
+
     # Standard Python Logging konfigurieren
     logging.basicConfig(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         level=getattr(logging, level.upper()),
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stderr) if verbose else logging.NullHandler(),
-        ],
+        handlers=handlers,
     )
 
     # Third-Party Logger auf WARNING setzen (weniger Noise)
@@ -155,7 +179,7 @@ def log_error_with_trace(message: str, error: Exception):
 
 def get_recent_logs(lines: int = 100) -> list[str]:
     """Gibt die letzten Log-Zeilen zurück."""
-    if not CURRENT_LOG.exists():
+    if not CURRENT_LOG or not CURRENT_LOG.exists():
         return []
 
     with open(CURRENT_LOG) as f:
@@ -165,4 +189,6 @@ def get_recent_logs(lines: int = 100) -> list[str]:
 
 def get_log_files() -> list[Path]:
     """Gibt alle Log-Dateien zurück."""
+    if not LOG_DIR:
+        return []
     return sorted(LOG_DIR.glob("*.log"), reverse=True)

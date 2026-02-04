@@ -30,8 +30,15 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers
-RUN playwright install chromium
+# Create non-root user BEFORE installing Playwright
+RUN useradd -m -u 1000 scraper
+
+# Playwright Browser-Pfad für alle User zugänglich
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
+RUN mkdir -p /opt/playwright && chmod 777 /opt/playwright
+
+# Install Playwright browsers (als root, aber in shared directory)
+RUN playwright install chromium && playwright install-deps chromium
 
 # Application code - nur Scraper-relevante Module
 COPY src/scraper/ ./src/scraper/
@@ -40,9 +47,8 @@ COPY src/core/ ./src/core/
 COPY src/analysis/ ./src/analysis/
 COPY src/__init__.py ./src/
 
-# Create non-root user mit eingeschränkten Rechten
-RUN useradd -m -u 1000 scraper && \
-    chown -R scraper:scraper /app
+# Ownership setzen und zu non-root User wechseln
+RUN chown -R scraper:scraper /app
 USER scraper
 
 # Kein exposed Port - kommuniziert nur über DB/Redis

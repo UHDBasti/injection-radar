@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # ==========================================================================
   # PostgreSQL Datenbank
@@ -33,6 +31,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.orchestrator
     container_name: pishield-orchestrator
+    env_file:
+      - ../.env
     restart: unless-stopped
     depends_on:
       db:
@@ -40,14 +40,19 @@ services:
       redis:
         condition: service_started
     environment:
-      - DATABASE_URL=postgresql://pishield:${DB_PASSWORD:-changeme}@db:5432/pishield
+      # Datenbank (über PISHIELD_DB_* Prefix)
+      - PISHIELD_DB_TYPE=postgresql
+      - PISHIELD_DB_HOST=db
+      - PISHIELD_DB_PORT=5432
+      - PISHIELD_DB_NAME=pishield
+      - PISHIELD_DB_USER=pishield
+      - PISHIELD_DB_PASSWORD=${DB_PASSWORD:-changeme}
+      # Redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      # API Keys kommen aus env_file (../.env)
     volumes:
-      - ../config:/app/config:ro
+      # Config wird NICHT gemountet - nutzt nur Umgebungsvariablen
       - ../data:/app/data:ro
       - logs:/app/logs
     ports:
@@ -62,6 +67,8 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.scraper
+    env_file:
+      - ../.env
     # Wird über docker-compose scale gesteuert
     deploy:
       replicas: 2  # Start mit 2, max 10
@@ -75,11 +82,17 @@ services:
       redis:
         condition: service_started
     environment:
-      - DATABASE_URL=postgresql://pishield:${DB_PASSWORD:-changeme}@db:5432/pishield
+      # Datenbank (über PISHIELD_DB_* Prefix)
+      - PISHIELD_DB_TYPE=postgresql
+      - PISHIELD_DB_HOST=db
+      - PISHIELD_DB_PORT=5432
+      - PISHIELD_DB_NAME=pishield
+      - PISHIELD_DB_USER=pishield
+      - PISHIELD_DB_PASSWORD=${DB_PASSWORD:-changeme}
+      # Redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # API Keys kommen aus env_file (../.env)
     # Kein Zugriff auf Host-Filesystem (Isolation)
     read_only: true
     tmpfs:

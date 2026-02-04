@@ -40,16 +40,29 @@ class StartupManager:
         if not shutil.which("docker"):
             return False
 
-        # Docker Daemon läuft?
+        # Docker Daemon läuft und User hat Zugriff?
         try:
             result = subprocess.run(
                 ["docker", "info"],
                 capture_output=True,
+                text=True,
                 timeout=5,
             )
-            return result.returncode == 0
+            if result.returncode == 0:
+                return True
+
+            # Prüfe ob es ein Berechtigungsproblem ist
+            if "permission denied" in result.stderr.lower() or "connect:" in result.stderr.lower():
+                self.docker_permission_error = True
+                return False
+
+            return False
         except Exception:
             return False
+
+    def needs_docker_group(self) -> bool:
+        """Prüft ob der User zur docker-Gruppe hinzugefügt werden muss."""
+        return getattr(self, 'docker_permission_error', False)
 
     def check_docker_compose(self) -> bool:
         """Prüft ob docker-compose verfügbar ist."""
@@ -112,14 +125,30 @@ class StartupManager:
                 elif "scraper" in name:
                     status["scraper"] = True
 
-            all_running = all(status.values())
-            return all_running, status
+            # Basis-Services (DB + Redis) reichen für lokalen Scan-Modus
+            base_ready = status["db"] and status["redis"]
+            return base_ready, status
 
         except Exception:
             return False, status
 
-    def start_containers(self, progress_callback=None) -> bool:
-        """Startet alle Docker-Container."""
+    def are_base_services_running(self) -> bool:
+        """Prüft ob mindestens DB und Redis laufen."""
+        _, status = self.are_containers_running()
+        return status["db"] and status["redis"]
+
+    def are_full_services_running(self) -> bool:
+        """Prüft ob alle Services (inkl. Orchestrator, Scraper) laufen."""
+        _, status = self.are_containers_running()
+        return all(status.values())
+
+    def start_containers(self, services: list[str] = None, build: bool = False) -> bool:
+        """Startet Docker-Container.
+
+        Args:
+            services: Liste der zu startenden Services (default: db, redis)
+            build: Wenn True, Images neu bauen
+        """
         compose_cmd = self.get_compose_cmd()
         compose_file = DOCKER_DIR / "docker-compose.yml"
 
@@ -127,19 +156,27 @@ class StartupManager:
             log_error("docker_compose_not_found", path=str(compose_file))
             return False
 
+        # Default: nur Basis-Services (schneller Start)
+        if services is None:
+            services = ["db", "redis"]
+
         try:
             # Container starten
-            cmd = compose_cmd + [
-                "-f", str(compose_file),
-                "up", "-d",
-                "--build",  # Bei Bedarf neu bauen
-            ]
+            cmd = compose_cmd + ["-f", str(compose_file), "up", "-d"]
+            if build:
+                cmd.append("--build")
+            cmd.extend(services)
 
-            log_info("starting_containers", cmd=" ".join(cmd))
+            log_info("starting_containers", cmd=" ".join(cmd), services=services)
 
             # Umgebungsvariablen setzen
             env = os.environ.copy()
             env["DB_PASSWORD"] = env.get("PISHIELD_DB_PASSWORD", "pishield123")
+
+            # API Keys übernehmen
+            for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"]:
+                if key in os.environ:
+                    env[key] = os.environ[key]
 
             result = subprocess.run(
                 cmd,
@@ -164,6 +201,19 @@ class StartupManager:
             log_error("container_start_error", error=str(e))
             return False
 
+    def start_base_services(self) -> bool:
+        """Startet nur DB und Redis (schnell)."""
+        return self.start_containers(services=["db", "redis"])
+
+    def start_full_services(self) -> bool:
+        """Startet alle Services inkl. Orchestrator und Scraper."""
+        return self.start_containers(services=["db", "redis", "orchestrator", "scraper"], build=True)
+
+    def start_all_services(self) -> bool:
+        """Startet ALLE Services für Zwei-System-Architektur."""
+        # Alle Services gleichzeitig starten (ohne --build für Schnelligkeit)
+        return self.start_containers(services=["db", "redis", "orchestrator", "scraper"])
+
     def wait_for_services(self, timeout: int = 60) -> bool:
         """Wartet bis alle Services bereit sind."""
         import httpx
@@ -186,6 +236,51 @@ class StartupManager:
             time.sleep(1)
 
         log_error("services_not_ready", timeout=timeout)
+        return False
+
+    def wait_for_db(self, timeout: int = 30) -> bool:
+        """Wartet bis PostgreSQL bereit ist."""
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                result = subprocess.run(
+                    ["docker", "exec", "pishield-db", "pg_isready", "-U", "pishield"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    log_info("db_ready")
+                    return True
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        log_error("db_not_ready", timeout=timeout)
+        return False
+
+    def wait_for_redis(self, timeout: int = 10) -> bool:
+        """Wartet bis Redis bereit ist."""
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            try:
+                result = subprocess.run(
+                    ["docker", "exec", "pishield-redis", "redis-cli", "ping"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0 and "PONG" in result.stdout:
+                    log_info("redis_ready")
+                    return True
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        log_error("redis_not_ready", timeout=timeout)
         return False
 
     def stop_containers(self) -> bool:
@@ -236,11 +331,20 @@ def auto_start_services(console: Console) -> Tuple[bool, bool]:
     """
     manager = StartupManager()
 
+    # Lade .env Datei
+    manager.setup_environment()
+
     # Prüfe Docker
     console.print("[dim]Prüfe System...[/dim]")
 
     if not manager.check_docker():
-        console.print("[yellow]Docker nicht verfügbar - nutze lokalen Modus[/yellow]")
+        if manager.needs_docker_group():
+            console.print("[yellow]Docker installiert, aber keine Berechtigung.[/yellow]")
+            console.print("[dim]Lösung: Neu anmelden ODER CLI so starten:[/dim]")
+            console.print("[cyan]  sg docker -c 'injection-radar'[/cyan]")
+            console.print("[dim]Nutze vorerst lokalen Modus...[/dim]")
+        else:
+            console.print("[yellow]Docker nicht verfügbar - nutze lokalen Modus[/yellow]")
         log_warning("docker_not_available")
         return False, True
 
@@ -249,14 +353,20 @@ def auto_start_services(console: Console) -> Tuple[bool, bool]:
         log_warning("docker_compose_not_available")
         return False, True
 
-    # Prüfe ob Container bereits laufen
-    all_running, status = manager.are_containers_running()
+    # Prüfe ob ALLE Services laufen (inkl. Orchestrator)
+    base_ready, status = manager.are_containers_running()
+    all_running = all(status.values())
 
     if all_running:
-        console.print("[green]✓[/green] Services laufen bereits")
+        console.print("[green]✓[/green] Alle Services laufen bereits")
         return True, False
 
-    # Einige Container fehlen - starte alles
+    # Zeige was fehlt
+    missing = [k for k, v in status.items() if not v]
+    if missing:
+        console.print(f"[dim]Fehlende Services: {', '.join(missing)}[/dim]")
+
+    # ALLE Services starten
     console.print("[dim]Starte Backend-Services...[/dim]")
 
     with Progress(
@@ -266,20 +376,33 @@ def auto_start_services(console: Console) -> Tuple[bool, bool]:
         transient=True,
     ) as progress:
         # Container starten
-        task = progress.add_task("Starte Container...", total=None)
+        task = progress.add_task("Starte alle Services...", total=None)
 
-        if not manager.start_containers():
+        if not manager.start_all_services():
             console.print("[yellow]Container-Start fehlgeschlagen - nutze lokalen Modus[/yellow]")
             return False, True
 
-        # Auf Services warten
-        progress.update(task, description="Warte auf Services...")
+        # Auf DB warten
+        progress.update(task, description="Warte auf PostgreSQL...")
 
-        if not manager.wait_for_services(timeout=90):
-            console.print("[yellow]Services nicht bereit - nutze lokalen Modus[/yellow]")
+        if not manager.wait_for_db(timeout=30):
+            console.print("[yellow]Datenbank nicht bereit - nutze lokalen Modus[/yellow]")
             return False, True
 
-    console.print("[green]✓[/green] Backend-Services bereit")
+        progress.update(task, description="Warte auf Redis...")
+
+        if not manager.wait_for_redis(timeout=10):
+            console.print("[yellow]Redis nicht bereit - nutze lokalen Modus[/yellow]")
+            return False, True
+
+        # Auf Orchestrator API warten
+        progress.update(task, description="Warte auf Orchestrator...")
+
+        if not manager.wait_for_services(timeout=30):
+            console.print("[yellow]Orchestrator nicht bereit - nutze lokalen Modus[/yellow]")
+            return False, True
+
+    console.print("[green]✓[/green] Alle Services bereit (Zwei-System-Architektur)")
     return True, False
 
 
