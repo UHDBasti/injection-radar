@@ -479,8 +479,19 @@ def crawl(
 
 
 def main():
-    """Entry Point für das CLI."""
-    app()
+    """Entry Point für das CLI.
+
+    Wenn ohne Argumente aufgerufen: Interaktive Shell starten.
+    Mit Argumenten: Typer CLI verwenden.
+    """
+    import sys
+
+    # Wenn keine Argumente oder nur --help, interaktive Shell starten
+    if len(sys.argv) == 1:
+        from .interactive import interactive_shell
+        interactive_shell()
+    else:
+        app()
 
 
 if __name__ == "__main__":
