@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -17,7 +18,22 @@ from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.markdown import Markdown
 
+from ..core.logging import (
+    setup_logging,
+    log_info,
+    log_error,
+    log_warning,
+    log_scan,
+    log_llm_call,
+    log_error_with_trace,
+    get_recent_logs,
+    LOG_DIR,
+)
+
 console = Console()
+
+# Logger initialisieren
+logger = setup_logging(level="DEBUG")
 
 # Konfigurationspfad (wie Claude Code in ~/.config/)
 CONFIG_DIR = Path.home() / ".injection-radar"
@@ -26,27 +42,10 @@ HISTORY_FILE = CONFIG_DIR / "history.json"
 
 
 def get_banner():
-    """Zeigt das Willkommens-Banner."""
+    """Zeigt das Willkommens-Banner (dezent)."""
     return """
-[bold blue]╔══════════════════════════════════════════════════════════════╗
-║                                                              ║
-║   [bold white]██╗███╗   ██╗     ██╗███████╗ ██████╗████████╗██╗ ██████╗ ███╗   ██╗[/bold white]   ║
-║   [bold white]██║████╗  ██║     ██║██╔════╝██╔════╝╚══██╔══╝██║██╔═══██╗████╗  ██║[/bold white]   ║
-║   [bold white]██║██╔██╗ ██║     ██║█████╗  ██║        ██║   ██║██║   ██║██╔██╗ ██║[/bold white]   ║
-║   [bold white]██║██║╚██╗██║██   ██║██╔══╝  ██║        ██║   ██║██║   ██║██║╚██╗██║[/bold white]   ║
-║   [bold white]██║██║ ╚████║╚█████╔╝███████╗╚██████╗   ██║   ██║╚██████╔╝██║ ╚████║[/bold white]   ║
-║   [bold white]╚═╝╚═╝  ╚═══╝ ╚════╝ ╚══════╝ ╚═════╝   ╚═╝   ╚═╝ ╚═════╝ ╚═╝  ╚═══╝[/bold white]   ║
-║                                                              ║
-║             [bold cyan]██████╗  █████╗ ██████╗  █████╗ ██████╗[/bold cyan]             ║
-║             [bold cyan]██╔══██╗██╔══██╗██╔══██╗██╔══██╗██╔══██╗[/bold cyan]            ║
-║             [bold cyan]██████╔╝███████║██║  ██║███████║██████╔╝[/bold cyan]            ║
-║             [bold cyan]██╔══██╗██╔══██║██║  ██║██╔══██║██╔══██╗[/bold cyan]            ║
-║             [bold cyan]██║  ██║██║  ██║██████╔╝██║  ██║██║  ██║[/bold cyan]            ║
-║             [bold cyan]╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝[/bold cyan]            ║
-║                                                              ║
-║        [dim]Prompt Injection Scanner für Web-Inhalte[/dim]            ║
-║                      [dim]v0.1.0[/dim]                                 ║
-╚══════════════════════════════════════════════════════════════╝[/bold blue]
+[bold cyan]InjectionRadar[/bold cyan] [dim]v0.1.0[/dim]
+[dim]Prompt Injection Scanner für Web-Inhalte[/dim]
 """
 
 
@@ -244,6 +243,8 @@ def show_help():
 | `scan <url> --quick` | Schneller Scan ohne LLM (nur Patterns) |
 | `status` | Zeigt den aktuellen Status |
 | `config` | Öffnet den Konfigurations-Wizard |
+| `logs` | Zeigt die letzten Log-Einträge |
+| `logs -f` | Zeigt Pfad zur Log-Datei |
 | `history` | Zeigt letzte Scans |
 | `help` | Diese Hilfe |
 | `exit` / `quit` | Beendet InjectionRadar |
@@ -253,6 +254,7 @@ def show_help():
 ```
 > scan https://example.com
 > scan https://suspicious-site.com --quick
+> logs
 > config
 ```
 
@@ -264,12 +266,64 @@ def show_help():
     console.print(Markdown(help_text))
 
 
+def show_logs(show_path: bool = False):
+    """Zeigt die Logs an."""
+    from ..core.logging import get_recent_logs, get_log_files, CURRENT_LOG
+
+    if show_path:
+        console.print(f"[bold]Log-Verzeichnis:[/bold] {LOG_DIR}")
+        console.print(f"[bold]Aktuelles Log:[/bold] {CURRENT_LOG}")
+        console.print()
+        console.print("[bold]Log-Dateien:[/bold]")
+        for log_file in get_log_files()[:5]:
+            size = log_file.stat().st_size / 1024
+            console.print(f"  {log_file.name} ({size:.1f} KB)")
+        return
+
+    logs = get_recent_logs(50)
+    if not logs:
+        console.print("[dim]Keine Logs vorhanden.[/dim]")
+        return
+
+    console.print(f"[bold]Letzte {len(logs)} Log-Einträge:[/bold]\n")
+    for line in logs:
+        try:
+            entry = json.loads(line)
+            level = entry.get("level", "info").upper()
+            event = entry.get("event", "")
+            timestamp = entry.get("timestamp", "")[:19]
+
+            level_colors = {
+                "DEBUG": "dim",
+                "INFO": "blue",
+                "WARNING": "yellow",
+                "ERROR": "red",
+            }
+            color = level_colors.get(level, "white")
+
+            console.print(f"[{color}]{timestamp} [{level}][/{color}] {event}")
+
+            # Zeige zusätzliche Infos bei Scans
+            if "url" in entry:
+                console.print(f"  [dim]URL: {entry['url']}[/dim]")
+            if "severity_score" in entry:
+                console.print(f"  [dim]Severity: {entry['severity_score']}[/dim]")
+            if "error_message" in entry:
+                console.print(f"  [red]Error: {entry['error_message']}[/red]")
+        except json.JSONDecodeError:
+            # Falls kein JSON, zeige Zeile direkt
+            console.print(f"[dim]{line.strip()}[/dim]")
+
+
 async def do_scan(url: str, config: dict, quick: bool = False):
     """Führt einen Scan durch."""
     from ..analysis.detector import RedFlagDetector
     from ..core.models import ScrapedContent
     import httpx
     import hashlib
+
+    scan_mode = "pattern" if quick else "llm"
+    log_info("scan_started", url=url, mode=scan_mode, provider=config.get("provider", "none"))
 
     console.print(f"\n[bold]Scanne:[/bold] {url}")
     console.print(f"[dim]Modus: {'Pattern-Scan (schnell)' if quick else 'Vollständiger LLM-Scan'}[/dim]\n")
@@ -300,9 +354,11 @@ async def do_scan(url: str, config: dict, quick: bool = False):
                     content_hash=hashlib.sha256(html.encode()).hexdigest(),
                 )
         except Exception as e:
+            log_error("website_load_failed", url=url, error=str(e))
             console.print(f"[red]Fehler beim Laden: {e}[/red]")
             return
 
+    log_info("website_loaded", url=url, text_length=content.text_length, word_count=content.word_count)
     console.print(f"[green]✓[/green] Website geladen ({content.text_length:,} Zeichen)")
 
     # Analyse
@@ -347,6 +403,13 @@ async def do_scan(url: str, config: dict, quick: bool = False):
                     )
                     severity = detector.calculate_severity_score(flags)
 
+                    log_llm_call(
+                        provider=client.provider_name,
+                        model=client.model,
+                        tokens_in=result.tokens_input,
+                        tokens_out=result.tokens_output,
+                        cost=result.cost_estimated,
+                    )
                     console.print(f"[dim]LLM: {client.provider_name}/{client.model}[/dim]")
                     console.print(f"[dim]Tokens: {result.tokens_input} → {result.tokens_output}[/dim]")
                     console.print(f"[dim]Kosten: ${result.cost_estimated:.4f}[/dim]")
@@ -378,10 +441,18 @@ async def do_scan(url: str, config: dict, quick: bool = False):
                     )
                     severity = detector.calculate_severity_score(flags)
 
+                    log_llm_call(
+                        provider=client.provider_name,
+                        model=client.model,
+                        tokens_in=result.tokens_input,
+                        tokens_out=result.tokens_output,
+                        cost=result.cost_estimated,
+                    )
                     console.print(f"[dim]LLM: {client.provider_name}/{client.model}[/dim]")
                     console.print(f"[dim]Tokens: {result.tokens_input} → {result.tokens_output}[/dim]")
                     console.print(f"[dim]Kosten: ${result.cost_estimated:.4f}[/dim]")
                 else:
+                    log_warning("no_api_key_configured", provider=config.get("provider"))
                     console.print("[yellow]Kein API-Key konfiguriert. Verwende Pattern-Scan.[/yellow]")
                     flags = detector.detect_all(
                         llm_output=content.extracted_text,
@@ -390,6 +461,7 @@ async def do_scan(url: str, config: dict, quick: bool = False):
                     )
                     severity = detector.calculate_severity_score(flags)
             except Exception as e:
+                log_error_with_trace("llm_call_failed", e)
                 console.print(f"[red]LLM-Fehler: {e}[/red]")
                 console.print("[yellow]Fallback auf Pattern-Scan...[/yellow]")
                 flags = detector.detect_all(
@@ -444,15 +516,29 @@ async def do_scan(url: str, config: dict, quick: bool = False):
     else:
         console.print("[green]Keine verdächtigen Muster gefunden.[/green]")
 
+    # Scan-Ergebnis loggen
+    classification = "dangerous" if severity >= 6 else "suspicious" if severity >= 3 else "safe"
+    log_scan(
+        url=url,
+        result={
+            "severity_score": severity,
+            "flags_count": len(flags),
+            "classification": classification,
+            "flags": [{"type": f.type.value, "severity": f.severity.value} for f in flags],
+        }
+    )
+
     console.print()
 
 
 def interactive_shell():
     """Startet die interaktive Shell."""
+    log_info("interactive_shell_started")
     config = load_config()
 
     # Erstes Setup wenn nötig
     if not config or not config.get("provider"):
+        log_info("running_setup_wizard")
         config = setup_wizard()
 
     # Banner
@@ -503,6 +589,10 @@ def interactive_shell():
 
                 asyncio.run(do_scan(url, config, quick))
 
+            elif command == "logs":
+                show_path = "-f" in args or "--file" in args
+                show_logs(show_path)
+
             elif command == "history":
                 console.print("[dim]History-Feature kommt bald...[/dim]")
 
@@ -519,6 +609,7 @@ def interactive_shell():
             break
 
         except Exception as e:
+            log_error_with_trace("repl_error", e)
             console.print(f"[red]Fehler: {e}[/red]")
 
 
