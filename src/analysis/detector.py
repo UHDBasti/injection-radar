@@ -44,13 +44,13 @@ class RedFlagDetector:
     ]
 
     INSTRUCTION_PATTERNS = [
-        r"ignore (all |the |previous |above )?instructions",
-        r"disregard (all |the |previous |above )?instructions",
-        r"forget (all |the |previous |above )?instructions",
+        r"ignore\s+(all\s+)?(the\s+)?(previous\s+|above\s+)?instructions",
+        r"disregard\s+(all\s+)?(the\s+)?(previous\s+|above\s+)?instructions",
+        r"forget\s+(all\s+)?(the\s+)?(previous\s+|above\s+)?instructions",
         r"new instructions:",
         r"you must now",
         r"your new task is",
-        r"instead,? (you should|please|do)",
+        r"instead,?\s*(you should|please|do)",
         r"IMPORTANT:.*follow",
         r"SYSTEM:.*override",
     ]

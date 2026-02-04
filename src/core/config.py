@@ -9,11 +9,13 @@ from typing import Optional
 
 import yaml
 from pydantic import Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class LLMConfig(BaseSettings):
     """LLM-spezifische Konfiguration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     primary_analyzer: str = "claude-sonnet-4-5-20250929"
     max_input_tokens: int = 4000
     max_output_tokens: int = 1000
@@ -22,11 +24,13 @@ class LLMConfig(BaseSettings):
 
 class DatabaseConfig(BaseSettings):
     """Datenbank-Konfiguration."""
+    model_config = SettingsConfigDict(env_prefix="PISHIELD_DB_")
+
     host: str = "localhost"
     port: int = 5432
     name: str = "pishield"
     user: str = "pishield"
-    password: str = Field(default="", env="PISHIELD_DB_PASSWORD")
+    password: str = ""
     pool_size: int = 10
     max_overflow: int = 20
 
@@ -48,6 +52,8 @@ class ScrapingConfig(BaseSettings):
 
 class CrawlingConfig(BaseSettings):
     """Crawling-Management Konfiguration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     tranco_file: str = "data/top-1m.csv"
     tranco_limit: int = 100
     rescan_interval_safe: int = 30
@@ -58,6 +64,8 @@ class CrawlingConfig(BaseSettings):
 
 class APIConfig(BaseSettings):
     """API-Konfiguration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
     host: str = "0.0.0.0"
     port: int = 8000
     rate_limit_per_minute: int = 60
@@ -65,11 +73,17 @@ class APIConfig(BaseSettings):
 
 class Settings(BaseSettings):
     """Hauptkonfiguration."""
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",  # Ignoriere unbekannte Felder aus YAML
+    )
+
     # API Keys aus Umgebungsvariablen
-    anthropic_api_key: Optional[str] = Field(default=None, env="ANTHROPIC_API_KEY")
-    openai_api_key: Optional[str] = Field(default=None, env="OPENAI_API_KEY")
-    google_api_key: Optional[str] = Field(default=None, env="GOOGLE_API_KEY")
-    xai_api_key: Optional[str] = Field(default=None, env="XAI_API_KEY")
+    anthropic_api_key: Optional[str] = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
+    openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
+    google_api_key: Optional[str] = Field(default=None, validation_alias="GOOGLE_API_KEY")
+    xai_api_key: Optional[str] = Field(default=None, validation_alias="XAI_API_KEY")
 
     # Sub-Konfigurationen
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -81,10 +95,6 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_file: str = "logs/pishield.log"
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Settings":
