@@ -333,7 +333,12 @@ async def do_scan(url: str, config: dict, quick: bool = False):
     # Website laden
     with console.status("[bold green]Lade Website..."):
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; InjectionRadar/0.1; +https://github.com/injection-radar)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "de,en;q=0.5",
+            }
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30, headers=headers) as client:
                 response = await client.get(url)
                 html = response.text
 
