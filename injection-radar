@@ -4,7 +4,15 @@
 # Aktiviert automatisch das venv und startet das CLI
 #
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Löse Symlinks auf um den echten Pfad zu finden
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
 VENV_DIR="$SCRIPT_DIR/.venv"
 
 # Prüfe ob venv existiert

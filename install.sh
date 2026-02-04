@@ -254,16 +254,21 @@ fi
 # ============================================================================
 log_info "Erstelle globalen CLI-Befehl..."
 
-# Erstelle Wrapper-Script falls nicht vorhanden
-if [ ! -f "$SCRIPT_DIR/injection-radar" ] || [ ! -x "$SCRIPT_DIR/injection-radar" ]; then
-    cat > "$SCRIPT_DIR/injection-radar" << 'WRAPPEREOF'
+# Erstelle Wrapper-Script (löst Symlinks korrekt auf)
+cat > "$SCRIPT_DIR/injection-radar" << 'WRAPPEREOF'
 #!/bin/bash
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# InjectionRadar CLI Wrapper - löst Symlinks auf
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+    SOURCE="$(readlink "$SOURCE")"
+    [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 source "$SCRIPT_DIR/.venv/bin/activate"
 exec injection-radar "$@"
 WRAPPEREOF
-    chmod +x "$SCRIPT_DIR/injection-radar"
-fi
+chmod +x "$SCRIPT_DIR/injection-radar"
 
 # Erstelle ~/bin und Symlink
 mkdir -p "$HOME/bin"
