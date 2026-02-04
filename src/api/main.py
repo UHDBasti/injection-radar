@@ -280,13 +280,8 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
         # Confidence berechnen basierend auf Severity
         confidence = _calculate_confidence(result.severity_score, result.classification)
 
-        # In DB speichern (Background Task)
-        background_tasks.add_task(
-            _save_scan_results,
-            url_str,
-            result,
-            confidence,
-        )
+        # In DB speichern (direkt, nicht als Background Task weil es Probleme gab)
+        await _save_scan_results(url_str, result, confidence)
 
         return ScanResponse(
             job_id=job.job_id,
@@ -649,15 +644,15 @@ async def _save_scan_results(url_str: str, result: JobResult, confidence: float)
                     url=url_str,
                     current_status=classification,
                     current_confidence=confidence,
-                    first_scanned=datetime.now(timezone.utc),
-                    last_scanned=datetime.now(timezone.utc),
+                    first_scanned=datetime.utcnow(),
+                    last_scanned=datetime.utcnow(),
                     scan_count=1,
                 )
                 session.add(url_db)
             else:
                 url_db.current_status = classification
                 url_db.current_confidence = confidence
-                url_db.last_scanned = datetime.now(timezone.utc)
+                url_db.last_scanned = datetime.utcnow()
                 url_db.scan_count += 1
 
             await session.commit()
