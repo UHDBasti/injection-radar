@@ -13,7 +13,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Application code
-COPY src/ ./src/
+COPY src/__init__.py ./src/
+COPY src/api/ ./src/api/
+COPY src/core/ ./src/core/
 COPY config/ ./config/
 
 # Create non-root user

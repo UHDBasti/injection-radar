@@ -87,6 +87,27 @@ class APIConfig(BaseSettings):
     rate_limit_per_minute: int = 60
 
 
+class RedisConfig(BaseSettings):
+    """Redis-Konfiguration für Job Queue."""
+    model_config = SettingsConfigDict(env_prefix="REDIS_", extra="ignore")
+
+    host: str = "localhost"
+    port: int = 6379
+    db: int = 0
+    password: Optional[str] = None
+
+    # Queue Settings
+    job_timeout_seconds: int = 120
+    result_ttl_seconds: int = 3600
+
+    @property
+    def url(self) -> str:
+        """Generiert die Redis-URL."""
+        if self.password:
+            return f"redis://:{self.password}@{self.host}:{self.port}/{self.db}"
+        return f"redis://{self.host}:{self.port}/{self.db}"
+
+
 class Settings(BaseSettings):
     """Hauptkonfiguration."""
     model_config = SettingsConfigDict(
@@ -107,6 +128,7 @@ class Settings(BaseSettings):
     scraping: ScrapingConfig = Field(default_factory=ScrapingConfig)
     crawling: CrawlingConfig = Field(default_factory=CrawlingConfig)
     api: APIConfig = Field(default_factory=APIConfig)
+    redis: RedisConfig = Field(default_factory=RedisConfig)
 
     # Logging
     log_level: str = "INFO"

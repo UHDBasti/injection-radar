@@ -4,12 +4,18 @@ Scraper-Worker für InjectionRadar.
 Läuft in isolierten Docker-Containern und scraped Websites mit Playwright.
 Speichert Rohdaten direkt in die Datenbank und gibt nur strukturierte
 ScanResults an das Hauptsystem zurück.
+
+WICHTIG: Dieser Worker sieht die Rohdaten - das Hauptsystem (Orchestrator) nicht!
+Der Orchestrator erhält NUR das strukturierte JobResult über Redis.
 """
 
 import asyncio
 import hashlib
 import re
-from datetime import datetime
+import signal
+import sys
+import time
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
@@ -26,12 +32,18 @@ from ..core.database import (
     get_async_engine,
     get_async_session_factory,
 )
+from ..core.queue import JobQueue, QueueConfig, ScanJob, JobResult
+from ..core.logging import log_info, log_error, log_warning, log_debug, log_error_with_trace
 from ..llm import AnthropicClient, OpenAIClient, LLMResult, DUMMY_TOOLS
 from ..llm.anthropic import (
     SUMMARIZE_SYSTEM_PROMPT,
     SUMMARIZE_USER_PROMPT_TEMPLATE,
 )
 from ..analysis.detector import RedFlagDetector
+
+
+# Graceful shutdown flag
+_shutdown_requested = False
 
 
 class ScraperWorker:
@@ -71,7 +83,7 @@ class ScraperWorker:
         if not self.browser:
             raise RuntimeError("Worker not started. Call start() first.")
 
-        start_time = datetime.utcnow()
+        start_time = datetime.now(timezone.utc)
         context = await self.browser.new_context(
             user_agent=self.settings.scraping.user_agent,
         )
@@ -110,11 +122,11 @@ class ScraperWorker:
             content_hash = hashlib.sha256(raw_html.encode()).hexdigest()
 
             # Response-Zeit berechnen
-            response_time_ms = int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            response_time_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
 
             return ScrapedContent(
                 url_id=0,  # Wird später gesetzt
-                scraped_at=datetime.utcnow(),
+                scraped_at=datetime.now(timezone.utc),
                 server_ip=server_ip,
                 http_status=response.status,
                 response_time_ms=response_time_ms,
@@ -285,47 +297,90 @@ class ScraperWorker:
         )
 
 
+def _handle_shutdown_signal(signum, frame):
+    """Signal-Handler für graceful shutdown."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    log_info("shutdown_requested", signal=signum)
+
+
 async def worker_main():
-    """Hauptschleife des Workers."""
+    """Hauptschleife des Workers mit Redis Queue.
+
+    Der Worker:
+    1. Holt Jobs aus der Redis Queue
+    2. Scraped die Website (speichert Rohdaten in DB)
+    3. Führt LLM-Test durch
+    4. Sendet NUR strukturiertes JobResult zurück (keine Rohdaten!)
+    """
+    global _shutdown_requested
+
+    # Signal-Handler registrieren
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+
     settings = get_settings()
 
-    # Datenbank-Verbindung
+    # Redis Queue Konfiguration aus Settings
+    queue_config = QueueConfig(
+        host=settings.redis.host,
+        port=settings.redis.port,
+        db=settings.redis.db,
+        password=settings.redis.password,
+        job_timeout_seconds=settings.redis.job_timeout_seconds,
+        result_ttl_seconds=settings.redis.result_ttl_seconds,
+    )
+    queue = JobQueue(queue_config)
+
+    # Datenbank-Verbindung (für Rohdaten-Speicherung)
     engine = get_async_engine(settings.database.url)
     SessionFactory = get_async_session_factory(engine)
 
     worker = ScraperWorker()
-    await worker.start()
 
-    print(f"Scraper Worker started. Polling for jobs...")
+    log_info("worker_starting", redis_host=settings.redis.host, redis_port=settings.redis.port)
 
     try:
-        while True:
-            # TODO: Jobs aus Redis-Queue holen
-            # Für jetzt: Simple Polling aus der DB
-            async with SessionFactory() as session:
-                # Hole nächste URL mit Status PENDING
-                result = await session.execute(
-                    """
-                    SELECT id, url FROM urls
-                    WHERE current_status = 'pending'
-                    LIMIT 1
-                    FOR UPDATE SKIP LOCKED
-                    """
-                )
-                row = result.fetchone()
+        await worker.start()
+        await queue.connect()
 
-                if row:
-                    url_id, url = row
-                    print(f"Processing: {url}")
+        log_info("worker_started", status="ready")
+        print(f"Scraper Worker started. Waiting for jobs from Redis queue...")
 
-                    try:
-                        # Scrape
-                        content = await worker.scrape_url(url)
-                        content.url_id = url_id
+        while not _shutdown_requested:
+            try:
+                # Job aus Queue holen (blocking, 5s timeout für shutdown-check)
+                job = await queue.dequeue_scan(timeout_seconds=5)
 
-                        # In DB speichern
+                if job is None:
+                    # Timeout, check for shutdown
+                    continue
+
+                log_info("job_processing", job_id=job.job_id, url=job.url)
+                print(f"Processing job {job.job_id[:8]}...: {job.url}")
+
+                start_time = time.time()
+
+                try:
+                    # =========================================================
+                    # 1. Website scrapen (Rohdaten bleiben im Subsystem!)
+                    # =========================================================
+                    content = await worker.scrape_url(job.url)
+
+                    log_info(
+                        "website_scraped",
+                        job_id=job.job_id,
+                        url=job.url,
+                        text_length=content.text_length,
+                        word_count=content.word_count,
+                    )
+
+                    # =========================================================
+                    # 2. Rohdaten in Datenbank speichern (nur Subsystem sieht das!)
+                    # =========================================================
+                    async with SessionFactory() as session:
                         content_db = ScrapedContentDB(
-                            url_id=url_id,
+                            url_id=0,  # Kein FK in dieser Architektur
                             scraped_at=content.scraped_at,
                             server_ip=content.server_ip,
                             http_status=content.http_status,
@@ -341,22 +396,149 @@ async def worker_main():
                             content_hash=content.content_hash,
                         )
                         session.add(content_db)
-
-                        # LLM Test
-                        scan_result = await worker.run_llm_test(content)
-
-                        # TODO: ScanResult an Orchestrator senden
-                        print(f"Scan complete: {len(scan_result.flags_detected)} flags detected")
-
                         await session.commit()
+                        log_debug("scraped_content_saved", job_id=job.job_id)
 
-                    except Exception as e:
-                        print(f"Error processing {url}: {e}")
-                        await session.rollback()
-                else:
-                    # Keine Jobs, warten
-                    await asyncio.sleep(5)
+                    # =========================================================
+                    # 3. LLM-Test durchführen
+                    # =========================================================
+                    scan_result = await worker.run_llm_test(content, task_name=job.task_name)
 
+                    log_info(
+                        "llm_test_completed",
+                        job_id=job.job_id,
+                        flags_count=len(scan_result.flags_detected),
+                        tool_calls=scan_result.tool_calls_count,
+                    )
+
+                    # =========================================================
+                    # 4. NUR strukturiertes Ergebnis zurücksenden!
+                    #    KEINE Rohdaten (raw_html, extracted_text) im Result!
+                    # =========================================================
+                    processing_time_ms = int((time.time() - start_time) * 1000)
+
+                    # Severity Score berechnen
+                    severity_score = worker.detector.calculate_severity_score(
+                        scan_result.flags_detected
+                    )
+
+                    # Classification ableiten
+                    if severity_score >= 6.0:
+                        classification = "dangerous"
+                    elif severity_score >= 3.0:
+                        classification = "suspicious"
+                    elif severity_score > 0:
+                        classification = "suspicious"
+                    else:
+                        classification = "safe"
+
+                    # JobResult erstellen (NUR strukturierte Daten!)
+                    result = JobResult(
+                        job_id=job.job_id,
+                        url=job.url,
+                        status="completed",
+                        severity_score=severity_score,
+                        flags_count=len(scan_result.flags_detected),
+                        classification=classification,
+                        flags=[
+                            {
+                                "type": flag.type.value,
+                                "severity": flag.severity.value,
+                                "description": flag.description,
+                            }
+                            for flag in scan_result.flags_detected
+                        ],
+                        llm_provider=scan_result.llm_provider,
+                        llm_model=scan_result.llm_model,
+                        tokens_input=0,  # TODO: Von LLMResult übernehmen
+                        tokens_output=scan_result.output_length,
+                        cost_estimated=0.0,  # TODO: Berechnen
+                        processing_time_ms=processing_time_ms,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+
+                    # Ergebnis in Redis speichern
+                    await queue.set_result(result)
+
+                    log_info(
+                        "job_completed",
+                        job_id=job.job_id,
+                        severity=severity_score,
+                        classification=classification,
+                        processing_time_ms=processing_time_ms,
+                    )
+                    print(f"Job {job.job_id[:8]}... completed: {classification} (severity: {severity_score:.1f})")
+
+                except Exception as e:
+                    # Fehler-Result senden
+                    log_error_with_trace("job_failed", e)
+
+                    error_result = JobResult(
+                        job_id=job.job_id,
+                        url=job.url,
+                        status="failed",
+                        error_message=str(e),
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    await queue.set_result(error_result)
+
+                    print(f"Job {job.job_id[:8]}... failed: {e}")
+
+            except Exception as e:
+                log_error_with_trace("worker_loop_error", e)
+                await asyncio.sleep(1)  # Kurze Pause bei Fehlern
+
+    finally:
+        log_info("worker_stopping")
+        await worker.stop()
+        await queue.disconnect()
+        log_info("worker_stopped")
+        print("Worker stopped.")
+
+
+async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
+    """Führt einen einzelnen Scan durch (für Tests/CLI).
+
+    Diese Funktion umgeht die Queue und führt direkt einen Scan durch.
+    Nützlich für lokale Entwicklung ohne Docker/Redis.
+    """
+    worker = ScraperWorker()
+    await worker.start()
+
+    try:
+        content = await worker.scrape_url(url)
+        scan_result = await worker.run_llm_test(content)
+
+        severity_score = worker.detector.calculate_severity_score(
+            scan_result.flags_detected
+        )
+
+        if severity_score >= 6.0:
+            classification = "dangerous"
+        elif severity_score >= 3.0:
+            classification = "suspicious"
+        else:
+            classification = "safe"
+
+        return JobResult(
+            job_id="local-scan",
+            url=url,
+            status="completed",
+            severity_score=severity_score,
+            flags_count=len(scan_result.flags_detected),
+            classification=classification,
+            flags=[
+                {
+                    "type": flag.type.value,
+                    "severity": flag.severity.value,
+                    "description": flag.description,
+                }
+                for flag in scan_result.flags_detected
+            ],
+            llm_provider=scan_result.llm_provider,
+            llm_model=scan_result.llm_model,
+            completed_at=datetime.now(timezone.utc).isoformat(),
+        )
     finally:
         await worker.stop()
 

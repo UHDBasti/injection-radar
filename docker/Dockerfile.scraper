@@ -37,6 +37,8 @@ RUN playwright install chromium
 COPY src/scraper/ ./src/scraper/
 COPY src/llm/ ./src/llm/
 COPY src/core/ ./src/core/
+COPY src/analysis/ ./src/analysis/
+COPY src/__init__.py ./src/
 
 # Create non-root user mit eingeschränkten Rechten
 RUN useradd -m -u 1000 scraper && \

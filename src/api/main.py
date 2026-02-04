@@ -1,12 +1,16 @@
 """
-REST API für InjectionRadar.
+REST API für InjectionRadar (Orchestrator).
 
 FastAPI Server für externe Abfragen und Scan-Anfragen.
+
+WICHTIG: Der Orchestrator sieht NIEMALS Rohdaten (raw_html, extracted_text)!
+Er kommuniziert nur via Redis Queue mit dem Scraper-Subsystem und empfängt
+ausschließlich strukturierte JobResults.
 """
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
@@ -25,38 +29,51 @@ from ..core.database import (
     ScanResultDB,
     AnalysisResultDB,
 )
-from ..scraper.worker import ScraperWorker
-from ..analysis.detector import RedFlagDetector
+from ..core.queue import JobQueue, QueueConfig, ScanJob, JobResult
+from ..core.logging import log_info, log_error, log_warning
 
 
 # Global state
 settings = get_settings()
 engine = None
 SessionFactory = None
-worker: Optional[ScraperWorker] = None
+job_queue: Optional[JobQueue] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle Management für FastAPI."""
-    global engine, SessionFactory, worker
+    global engine, SessionFactory, job_queue
 
     # Startup
+    log_info("orchestrator_starting")
+
     engine = get_async_engine(settings.database.url)
     SessionFactory = get_async_session_factory(engine)
 
     # Datenbank initialisieren
     await init_db(engine)
 
-    # Worker starten (optional, für On-Demand Scans)
-    worker = ScraperWorker()
-    await worker.start()
+    # Redis Queue verbinden
+    queue_config = QueueConfig(
+        host=settings.redis.host,
+        port=settings.redis.port,
+        db=settings.redis.db,
+        password=settings.redis.password,
+        job_timeout_seconds=settings.redis.job_timeout_seconds,
+        result_ttl_seconds=settings.redis.result_ttl_seconds,
+    )
+    job_queue = JobQueue(queue_config)
+    await job_queue.connect()
+
+    log_info("orchestrator_started", redis=f"{settings.redis.host}:{settings.redis.port}")
 
     yield
 
     # Shutdown
-    if worker:
-        await worker.stop()
+    log_info("orchestrator_stopping")
+    if job_queue:
+        await job_queue.disconnect()
 
 
 app = FastAPI(
@@ -76,7 +93,9 @@ app.add_middleware(
 )
 
 
+# ============================================================================
 # Request/Response Models
+# ============================================================================
 
 class ScanRequest(BaseModel):
     """Request für einen URL-Scan."""
@@ -85,14 +104,35 @@ class ScanRequest(BaseModel):
 
 
 class ScanResponse(BaseModel):
-    """Response eines Scans."""
+    """Response eines Scans (NUR strukturierte Daten!)."""
+    job_id: str
     url: str
-    classification: Classification
-    confidence: float
-    severity_score: float
-    flags_count: int
-    flags: list[dict]
-    scanned_at: datetime
+    status: str  # "completed", "failed", "pending"
+    classification: Optional[str] = None
+    confidence: Optional[float] = None
+    severity_score: Optional[float] = None
+    flags_count: Optional[int] = None
+    flags: Optional[list[dict]] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    processing_time_ms: Optional[int] = None
+    scanned_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+
+
+class AsyncScanResponse(BaseModel):
+    """Response für asynchronen Scan (nur Job-ID)."""
+    job_id: str
+    url: str
+    status: str
+    message: str
+
+
+class JobStatusResponse(BaseModel):
+    """Status eines laufenden Jobs."""
+    job_id: str
+    status: str
+    result: Optional[ScanResponse] = None
 
 
 class DomainStats(BaseModel):
@@ -113,15 +153,29 @@ class StatusResponse(BaseModel):
     dangerous_count: int
     suspicious_count: int
     pending_count: int
+    queue_length: int
     last_scan: Optional[datetime]
 
 
+# ============================================================================
 # Endpoints
+# ============================================================================
 
 @app.get("/health")
 async def health_check():
     """Health Check Endpoint."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    queue_ok = job_queue is not None
+    try:
+        if job_queue:
+            await job_queue.get_queue_length()
+    except Exception:
+        queue_ok = False
+
+    return {
+        "status": "healthy" if queue_ok else "degraded",
+        "redis_connected": queue_ok,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 @app.get("/status", response_model=StatusResponse)
@@ -147,6 +201,14 @@ async def get_status():
             select(func.max(AnalysisResultDB.analyzed_at))
         )
 
+        # Queue-Länge
+        queue_length = 0
+        if job_queue:
+            try:
+                queue_length = await job_queue.get_queue_length()
+            except Exception:
+                pass
+
         total = sum(status_counts.values())
 
         return StatusResponse(
@@ -156,97 +218,158 @@ async def get_status():
             dangerous_count=status_counts.get(Classification.DANGEROUS, 0),
             suspicious_count=status_counts.get(Classification.SUSPICIOUS, 0),
             pending_count=status_counts.get(Classification.PENDING, 0),
+            queue_length=queue_length,
             last_scan=last_analysis,
         )
 
 
 @app.post("/scan", response_model=ScanResponse)
 async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
-    """Scannt eine URL auf Prompt Injection.
+    """Scannt eine URL auf Prompt Injection (synchron, wartet auf Ergebnis).
 
-    Führt einen vollständigen Scan durch:
-    1. Scraped die Website
-    2. Testet mit LLM
-    3. Analysiert auf Red Flags
-    4. Speichert Ergebnisse
+    Der Orchestrator:
+    1. Sendet Job an Redis Queue
+    2. Wartet auf Ergebnis vom Scraper-Subsystem
+    3. Empfängt NUR strukturiertes JobResult (keine Rohdaten!)
+    4. Speichert Analyse in Datenbank
     """
-    if not worker:
-        raise HTTPException(status_code=503, detail="Scanner not available")
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Queue not available")
+
+    url_str = str(request.url)
+    log_info("scan_requested", url=url_str, task=request.task)
+
+    try:
+        # Job in Queue einstellen
+        job = await job_queue.enqueue_scan(url_str, request.task)
+
+        # Auf Ergebnis warten (blocking mit Timeout)
+        result = await job_queue.get_result(
+            job.job_id,
+            timeout_seconds=settings.redis.job_timeout_seconds,
+        )
+
+        if result is None:
+            log_warning("scan_timeout", job_id=job.job_id, url=url_str)
+            return ScanResponse(
+                job_id=job.job_id,
+                url=url_str,
+                status="timeout",
+                error_message="Scan timed out. The scraper might be overloaded.",
+            )
+
+        if result.status == "failed":
+            log_error("scan_failed", job_id=job.job_id, error=result.error_message)
+            return ScanResponse(
+                job_id=job.job_id,
+                url=url_str,
+                status="failed",
+                error_message=result.error_message,
+            )
+
+        # Erfolgreiche Antwort
+        # WICHTIG: Hier sehen wir NUR strukturierte Daten, keine Rohdaten!
+        log_info(
+            "scan_completed",
+            job_id=job.job_id,
+            url=url_str,
+            classification=result.classification,
+            severity=result.severity_score,
+        )
+
+        # Confidence berechnen basierend auf Severity
+        confidence = _calculate_confidence(result.severity_score, result.classification)
+
+        # In DB speichern (Background Task)
+        background_tasks.add_task(
+            _save_scan_results,
+            url_str,
+            result,
+            confidence,
+        )
+
+        return ScanResponse(
+            job_id=job.job_id,
+            url=url_str,
+            status="completed",
+            classification=result.classification,
+            confidence=confidence,
+            severity_score=result.severity_score,
+            flags_count=result.flags_count,
+            flags=result.flags,
+            llm_provider=result.llm_provider,
+            llm_model=result.llm_model,
+            processing_time_ms=result.processing_time_ms,
+            scanned_at=datetime.now(timezone.utc),
+        )
+
+    except Exception as e:
+        log_error("scan_error", url=url_str, error=str(e))
+        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+
+
+@app.post("/scan/async", response_model=AsyncScanResponse)
+async def scan_url_async(request: ScanRequest):
+    """Startet einen asynchronen Scan (gibt sofort Job-ID zurück).
+
+    Nutze GET /scan/{job_id}/status um den Status abzufragen.
+    """
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Queue not available")
 
     url_str = str(request.url)
 
     try:
-        # Scrapen
-        content = await worker.scrape_url(url_str)
+        job = await job_queue.enqueue_scan(url_str, request.task)
 
-        # LLM Test
-        scan_result = await worker.run_llm_test(content, request.task)
+        log_info("async_scan_queued", job_id=job.job_id, url=url_str)
 
-        # Klassifizierung berechnen
-        detector = RedFlagDetector()
-        severity_score = detector.calculate_severity_score(scan_result.flags_detected)
-
-        # Klassifizierung basierend auf Schweregrad
-        if severity_score >= 6.0:
-            classification = Classification.DANGEROUS
-            confidence = min(0.9, severity_score / 10)
-        elif severity_score >= 3.0:
-            classification = Classification.SUSPICIOUS
-            confidence = 0.7
-        elif severity_score > 0:
-            classification = Classification.SUSPICIOUS
-            confidence = 0.5
-        else:
-            classification = Classification.SAFE
-            confidence = 0.8
-
-        # In DB speichern (Background Task)
-        async def save_results():
-            async with SessionFactory() as session:
-                # URL speichern/aktualisieren
-                url_db = await session.scalar(
-                    select(URLDB).where(URLDB.url == url_str)
-                )
-
-                if not url_db:
-                    url_db = URLDB(
-                        url=url_str,
-                        current_status=classification,
-                        current_confidence=confidence,
-                        first_scanned=datetime.utcnow(),
-                        last_scanned=datetime.utcnow(),
-                        scan_count=1,
-                    )
-                    session.add(url_db)
-                else:
-                    url_db.current_status = classification
-                    url_db.current_confidence = confidence
-                    url_db.last_scanned = datetime.utcnow()
-                    url_db.scan_count += 1
-
-                await session.commit()
-
-        background_tasks.add_task(save_results)
-
-        return ScanResponse(
+        return AsyncScanResponse(
+            job_id=job.job_id,
             url=url_str,
-            classification=classification,
-            confidence=confidence,
-            severity_score=severity_score,
-            flags_count=len(scan_result.flags_detected),
-            flags=[
-                {
-                    "type": f.type.value,
-                    "severity": f.severity.value,
-                    "description": f.description,
-                }
-                for f in scan_result.flags_detected
-            ],
-            scanned_at=datetime.utcnow(),
+            status="queued",
+            message="Scan queued. Poll /scan/{job_id}/status for results.",
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue scan: {str(e)}")
+
+
+@app.get("/scan/{job_id}/status", response_model=JobStatusResponse)
+async def get_scan_status(job_id: str):
+    """Prüft den Status eines laufenden Scans."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Queue not available")
+
+    result = await job_queue.get_result_nowait(job_id)
+
+    if result is None:
+        return JobStatusResponse(
+            job_id=job_id,
+            status="pending",
+            result=None,
+        )
+
+    confidence = _calculate_confidence(result.severity_score, result.classification)
+
+    return JobStatusResponse(
+        job_id=job_id,
+        status=result.status,
+        result=ScanResponse(
+            job_id=job_id,
+            url=result.url,
+            status=result.status,
+            classification=result.classification,
+            confidence=confidence,
+            severity_score=result.severity_score,
+            flags_count=result.flags_count,
+            flags=result.flags,
+            llm_provider=result.llm_provider,
+            llm_model=result.llm_model,
+            processing_time_ms=result.processing_time_ms,
+            error_message=result.error_message,
+        ),
+    )
 
 
 @app.get("/results/{url_id}")
@@ -377,7 +500,83 @@ async def list_dangerous(
         }
 
 
-# Entry point für uvicorn
+@app.get("/queue/stats")
+async def get_queue_stats():
+    """Gibt Queue-Statistiken zurück."""
+    if not job_queue:
+        raise HTTPException(status_code=503, detail="Queue not available")
+
+    try:
+        length = await job_queue.get_queue_length()
+        return {
+            "queue_length": length,
+            "redis_host": settings.redis.host,
+            "redis_port": settings.redis.port,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Queue error: {str(e)}")
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def _calculate_confidence(severity_score: float, classification: str) -> float:
+    """Berechnet die Confidence basierend auf Severity und Classification."""
+    if classification == "dangerous":
+        return min(0.9, severity_score / 10)
+    elif classification == "suspicious":
+        if severity_score >= 3.0:
+            return 0.7
+        return 0.5
+    else:  # safe
+        return 0.8
+
+
+async def _save_scan_results(url_str: str, result: JobResult, confidence: float):
+    """Speichert Scan-Ergebnisse in der Datenbank."""
+    try:
+        # Convert classification string to enum
+        classification_map = {
+            "safe": Classification.SAFE,
+            "suspicious": Classification.SUSPICIOUS,
+            "dangerous": Classification.DANGEROUS,
+        }
+        classification = classification_map.get(result.classification, Classification.PENDING)
+
+        async with SessionFactory() as session:
+            # URL speichern/aktualisieren
+            url_db = await session.scalar(
+                select(URLDB).where(URLDB.url == url_str)
+            )
+
+            if not url_db:
+                url_db = URLDB(
+                    url=url_str,
+                    current_status=classification,
+                    current_confidence=confidence,
+                    first_scanned=datetime.now(timezone.utc),
+                    last_scanned=datetime.now(timezone.utc),
+                    scan_count=1,
+                )
+                session.add(url_db)
+            else:
+                url_db.current_status = classification
+                url_db.current_confidence = confidence
+                url_db.last_scanned = datetime.now(timezone.utc)
+                url_db.scan_count += 1
+
+            await session.commit()
+            log_info("scan_results_saved", url=url_str, classification=result.classification)
+
+    except Exception as e:
+        log_error("save_results_failed", url=url_str, error=str(e))
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
 def create_app() -> FastAPI:
     """Factory Function für die FastAPI App."""
     return app

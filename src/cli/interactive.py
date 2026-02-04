@@ -239,7 +239,8 @@ def show_help():
 
 | Befehl | Beschreibung |
 |--------|--------------|
-| `scan <url>` | Scannt eine URL auf Prompt Injection |
+| `scan <url>` | Scannt eine URL via Orchestrator-API |
+| `scan <url> --local` | Lokaler Scan ohne Docker/Redis |
 | `scan <url> --quick` | Schneller Scan ohne LLM (nur Patterns) |
 | `status` | Zeigt den aktuellen Status |
 | `config` | Öffnet den Konfigurations-Wizard |
@@ -249,13 +250,22 @@ def show_help():
 | `help` | Diese Hilfe |
 | `exit` / `quit` | Beendet InjectionRadar |
 
+## Architektur-Modi
+
+- **Standard**: Nutzt Orchestrator-API (Zwei-System-Architektur)
+  - Sichere Isolation: Rohdaten bleiben im Scraper-Subsystem
+  - Benötigt Docker + Redis
+
+- **--local**: Lokaler Modus (für Entwicklung)
+  - Alles läuft im selben Prozess
+  - Keine Sandbox-Isolation!
+
 ## Beispiele
 
 ```
-> scan https://example.com
-> scan https://suspicious-site.com --quick
-> logs
-> config
+> scan https://example.com            # Via API
+> scan https://example.com --local    # Lokal (Entwicklung)
+> scan https://bad-site.com --quick   # Nur Pattern-Check
 ```
 
 ## Tastenkürzel
@@ -315,18 +325,92 @@ def show_logs(show_path: bool = False):
             console.print(f"[dim]{line.strip()}[/dim]")
 
 
-async def do_scan(url: str, config: dict, quick: bool = False):
-    """Führt einen Scan durch."""
+async def do_scan_via_api(url: str, config: dict):
+    """Führt einen Scan via Orchestrator-API durch (Zwei-System-Architektur).
+
+    Der CLI ruft die API auf, die wiederum über Redis mit dem
+    Scraper-Subsystem kommuniziert. So sieht der Orchestrator
+    niemals die Rohdaten.
+    """
+    import httpx
+
+    api_url = config.get("orchestrator_url", "http://localhost:8000")
+    log_info("api_scan_started", url=url, api=api_url)
+
+    console.print(f"\n[bold]Scanne via API:[/bold] {url}")
+    console.print(f"[dim]Orchestrator: {api_url}[/dim]\n")
+
+    try:
+        with console.status("[bold green]Sende an Orchestrator..."):
+            async with httpx.AsyncClient(timeout=180) as client:
+                response = await client.post(
+                    f"{api_url}/scan",
+                    json={"url": url, "task": "summarize"},
+                )
+
+                if response.status_code != 200:
+                    error = response.json().get("detail", "Unknown error")
+                    log_error("api_scan_failed", url=url, status=response.status_code, error=error)
+                    console.print(f"[red]API-Fehler ({response.status_code}): {error}[/red]")
+                    return
+
+                result = response.json()
+
+        # Ergebnis anzeigen
+        status = result.get("status")
+        if status == "timeout":
+            console.print("[yellow]Scan-Timeout. Der Scraper ist möglicherweise überlastet.[/yellow]")
+            return
+        elif status == "failed":
+            console.print(f"[red]Scan fehlgeschlagen: {result.get('error_message')}[/red]")
+            return
+
+        severity = result.get("severity_score", 0)
+        flags = result.get("flags", [])
+        classification = result.get("classification", "unknown")
+
+        log_info(
+            "api_scan_completed",
+            url=url,
+            classification=classification,
+            severity=severity,
+            flags_count=len(flags),
+        )
+
+        # LLM-Info anzeigen
+        if result.get("llm_provider"):
+            console.print(f"[dim]LLM: {result['llm_provider']}/{result.get('llm_model', 'unknown')}[/dim]")
+        if result.get("processing_time_ms"):
+            console.print(f"[dim]Verarbeitung: {result['processing_time_ms']}ms[/dim]")
+
+        _display_scan_result(severity, flags, classification)
+
+    except httpx.ConnectError:
+        log_error("api_connection_failed", url=api_url)
+        console.print(f"[red]Keine Verbindung zum Orchestrator ({api_url})[/red]")
+        console.print("[yellow]Tipp: Starte den Orchestrator mit 'docker-compose up' oder nutze '--local' für lokalen Scan[/yellow]")
+    except Exception as e:
+        log_error_with_trace("api_scan_error", e)
+        console.print(f"[red]Fehler: {e}[/red]")
+
+
+async def do_scan_local(url: str, config: dict, quick: bool = False):
+    """Führt einen lokalen Scan durch (ohne Docker/Redis).
+
+    Dieser Modus ist für Entwicklung und Tests gedacht.
+    ACHTUNG: Hier läuft alles in einem Prozess, keine Isolation!
+    """
     from ..analysis.detector import RedFlagDetector
     from ..core.models import ScrapedContent
     import httpx
     import hashlib
 
     scan_mode = "pattern" if quick else "llm"
-    log_info("scan_started", url=url, mode=scan_mode, provider=config.get("provider", "none"))
+    log_info("local_scan_started", url=url, mode=scan_mode, provider=config.get("provider", "none"))
 
-    console.print(f"\n[bold]Scanne:[/bold] {url}")
-    console.print(f"[dim]Modus: {'Pattern-Scan (schnell)' if quick else 'Vollständiger LLM-Scan'}[/dim]\n")
+    console.print(f"\n[bold]Scanne (lokal):[/bold] {url}")
+    console.print(f"[dim]Modus: {'Pattern-Scan (schnell)' if quick else 'Vollständiger LLM-Scan'}[/dim]")
+    console.print("[dim yellow]⚠ Lokaler Modus - keine Sandbox-Isolation![/dim yellow]\n")
 
     detector = RedFlagDetector()
 
@@ -477,6 +561,23 @@ async def do_scan(url: str, config: dict, quick: bool = False):
                 severity = detector.calculate_severity_score(flags)
 
     # Ergebnis anzeigen
+    classification = "dangerous" if severity >= 6 else "suspicious" if severity >= 3 else "safe"
+    _display_scan_result(severity, flags, classification, is_local=True)
+
+    # Scan-Ergebnis loggen
+    log_scan(
+        url=url,
+        result={
+            "severity_score": severity,
+            "flags_count": len(flags),
+            "classification": classification,
+            "flags": [{"type": f.type.value, "severity": f.severity.value} for f in flags],
+        }
+    )
+
+
+def _display_scan_result(severity: float, flags: list, classification: str, is_local: bool = False):
+    """Zeigt das Scan-Ergebnis an (wiederverwendbar für beide Modi)."""
     console.print()
 
     if severity >= 6:
@@ -501,39 +602,73 @@ async def do_scan(url: str, config: dict, quick: bool = False):
         table.add_column("Schweregrad")
         table.add_column("Beschreibung")
 
-        from ..core.models import Severity
-        severity_colors = {
-            Severity.CRITICAL: "red",
-            Severity.HIGH: "orange1",
-            Severity.MEDIUM: "yellow",
-            Severity.LOW: "blue",
+        # Für lokalen Scan haben wir RedFlag-Objekte, für API haben wir dicts
+        severity_color_map = {
+            "critical": "red",
+            "high": "orange1",
+            "medium": "yellow",
+            "low": "blue",
         }
 
         for flag in flags:
-            color = severity_colors.get(flag.severity, "white")
-            table.add_row(
-                flag.type.value,
-                f"[{color}]{flag.severity.value}[/{color}]",
-                flag.description,
-            )
+            if is_local:
+                # RedFlag-Objekt
+                from ..core.models import Severity
+                color = {
+                    Severity.CRITICAL: "red",
+                    Severity.HIGH: "orange1",
+                    Severity.MEDIUM: "yellow",
+                    Severity.LOW: "blue",
+                }.get(flag.severity, "white")
+                table.add_row(
+                    flag.type.value,
+                    f"[{color}]{flag.severity.value}[/{color}]",
+                    flag.description,
+                )
+            else:
+                # Dict von API
+                sev = flag.get("severity", "low")
+                color = severity_color_map.get(sev, "white")
+                table.add_row(
+                    flag.get("type", "unknown"),
+                    f"[{color}]{sev}[/{color}]",
+                    flag.get("description", ""),
+                )
 
         console.print(table)
     else:
         console.print("[green]Keine verdächtigen Muster gefunden.[/green]")
 
-    # Scan-Ergebnis loggen
-    classification = "dangerous" if severity >= 6 else "suspicious" if severity >= 3 else "safe"
-    log_scan(
-        url=url,
-        result={
-            "severity_score": severity,
-            "flags_count": len(flags),
-            "classification": classification,
-            "flags": [{"type": f.type.value, "severity": f.severity.value} for f in flags],
-        }
-    )
-
     console.print()
+
+
+async def do_scan(url: str, config: dict, quick: bool = False, local: bool = False):
+    """Führt einen Scan durch (wählt automatisch den Modus).
+
+    Args:
+        url: Die zu scannende URL
+        config: Konfiguration (API-Keys, etc.)
+        quick: Nur Pattern-Scan ohne LLM
+        local: Lokaler Modus ohne API (für Entwicklung)
+    """
+    # Wenn local=True oder API nicht konfiguriert, nutze lokalen Modus
+    use_local = local or config.get("use_local_mode", False)
+
+    if use_local:
+        await do_scan_local(url, config, quick)
+    else:
+        # Prüfe ob Orchestrator erreichbar ist
+        api_url = config.get("orchestrator_url", "http://localhost:8000")
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=2) as client:
+                await client.get(f"{api_url}/health")
+            # API erreichbar, nutze sie
+            await do_scan_via_api(url, config)
+        except Exception:
+            # API nicht erreichbar, Fallback auf lokalen Modus
+            console.print("[yellow]Orchestrator nicht erreichbar - nutze lokalen Modus[/yellow]")
+            await do_scan_local(url, config, quick)
 
 
 def interactive_shell():
@@ -591,8 +726,9 @@ def interactive_shell():
                     url = "https://" + url
 
                 quick = "--quick" in args or "-q" in args
+                local = "--local" in args or "-l" in args
 
-                asyncio.run(do_scan(url, config, quick))
+                asyncio.run(do_scan(url, config, quick, local))
 
             elif command == "logs":
                 show_path = "-f" in args or "--file" in args
