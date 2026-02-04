@@ -749,82 +749,101 @@ def interactive_shell():
     # Hilfe-Hinweis
     console.print("[dim]Tippe 'help' für verfügbare Befehle oder 'scan <url>' zum Starten.[/dim]\n")
 
-    # REPL
-    while True:
-        try:
-            cmd = Prompt.ask("[bold cyan]>[/bold cyan]")
-            cmd = cmd.strip()
+    # Event Loop für die gesamte Session (vermeidet "Event loop is closed" Fehler)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-            if not cmd:
+    # REPL
+    try:
+        while True:
+            try:
+                cmd = Prompt.ask("[bold cyan]>[/bold cyan]")
+                cmd = cmd.strip()
+
+                if not cmd:
+                    continue
+
+                parts = cmd.split()
+                command = parts[0].lower()
+                args = parts[1:]
+
+                if command in ["exit", "quit", "q"]:
+                    console.print("\n[dim]Auf Wiedersehen![/dim]\n")
+                    break
+
+                elif command == "help":
+                    show_help()
+
+                elif command == "status":
+                    show_status(config)
+
+                elif command == "config":
+                    config = setup_wizard()
+
+                elif command == "scan":
+                    if not args:
+                        console.print("[red]Bitte gib eine URL an: scan <url>[/red]")
+                        continue
+
+                    url = args[0]
+                    if not url.startswith(("http://", "https://")):
+                        url = "https://" + url
+
+                    quick = "--quick" in args or "-q" in args
+                    local = "--local" in args or "-l" in args
+
+                    # Nutze den persistenten Event Loop
+                    loop.run_until_complete(do_scan(url, config, quick, local))
+
+                elif command == "logs":
+                    show_path = "-f" in args or "--file" in args
+                    show_logs(show_path)
+
+                elif command == "history":
+                    console.print("[dim]History-Feature kommt bald...[/dim]")
+
+                elif command == "services":
+                    show_services_status()
+
+                elif command == "restart":
+                    # Services neu starten
+                    console.print("[dim]Starte Services neu...[/dim]")
+                    manager = StartupManager()
+                    if manager.check_docker():
+                        manager.stop_containers()
+                        services_ready, use_local = auto_start_services(console)
+                        config["use_local_mode"] = use_local
+                    else:
+                        console.print("[yellow]Docker nicht verfügbar[/yellow]")
+
+                else:
+                    console.print(f"[red]Unbekannter Befehl: {command}[/red]")
+                    console.print("[dim]Tippe 'help' für verfügbare Befehle.[/dim]")
+
+            except KeyboardInterrupt:
+                console.print("\n[dim]Abgebrochen. Tippe 'exit' zum Beenden.[/dim]")
                 continue
 
-            parts = cmd.split()
-            command = parts[0].lower()
-            args = parts[1:]
-
-            if command in ["exit", "quit", "q"]:
+            except EOFError:
                 console.print("\n[dim]Auf Wiedersehen![/dim]\n")
                 break
 
-            elif command == "help":
-                show_help()
+            except Exception as e:
+                log_error_with_trace("repl_error", e)
+                console.print(f"[red]Fehler: {e}[/red]")
 
-            elif command == "status":
-                show_status(config)
-
-            elif command == "config":
-                config = setup_wizard()
-
-            elif command == "scan":
-                if not args:
-                    console.print("[red]Bitte gib eine URL an: scan <url>[/red]")
-                    continue
-
-                url = args[0]
-                if not url.startswith(("http://", "https://")):
-                    url = "https://" + url
-
-                quick = "--quick" in args or "-q" in args
-                local = "--local" in args or "-l" in args
-
-                asyncio.run(do_scan(url, config, quick, local))
-
-            elif command == "logs":
-                show_path = "-f" in args or "--file" in args
-                show_logs(show_path)
-
-            elif command == "history":
-                console.print("[dim]History-Feature kommt bald...[/dim]")
-
-            elif command == "services":
-                show_services_status()
-
-            elif command == "restart":
-                # Services neu starten
-                console.print("[dim]Starte Services neu...[/dim]")
-                manager = StartupManager()
-                if manager.check_docker():
-                    manager.stop_containers()
-                    services_ready, use_local = auto_start_services(console)
-                    config["use_local_mode"] = use_local
-                else:
-                    console.print("[yellow]Docker nicht verfügbar[/yellow]")
-
-            else:
-                console.print(f"[red]Unbekannter Befehl: {command}[/red]")
-                console.print("[dim]Tippe 'help' für verfügbare Befehle.[/dim]")
-
-        except KeyboardInterrupt:
-            console.print("\n[dim]Abgebrochen. Tippe 'exit' zum Beenden.[/dim]")
-            continue
-
-        except EOFError:
-            console.print("\n[dim]Auf Wiedersehen![/dim]\n")
-            break
-
-        except Exception as e:
-            log_error_with_trace("repl_error", e)
-            console.print(f"[red]Fehler: {e}[/red]")
+    finally:
+        # Event Loop sauber schließen
+        try:
+            # Alle pending tasks canceln
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            # Loop schließen
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+        except Exception:
+            pass
 
 
 def main():

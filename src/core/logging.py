@@ -47,6 +47,19 @@ def setup_logging(
         ],
     )
 
+    # Third-Party Logger auf WARNING setzen (weniger Noise)
+    for noisy_logger in [
+        "httpx",
+        "httpcore",
+        "anthropic",
+        "openai",
+        "urllib3",
+        "asyncio",
+        "markdown_it",
+        "playwright",
+    ]:
+        logging.getLogger(noisy_logger).setLevel(logging.WARNING)
+
     # Structlog konfigurieren
     structlog.configure(
         processors=[
