@@ -24,8 +24,15 @@ class LLMConfig(BaseSettings):
 
 class DatabaseConfig(BaseSettings):
     """Datenbank-Konfiguration."""
-    model_config = SettingsConfigDict(env_prefix="PISHIELD_DB_")
+    model_config = SettingsConfigDict(env_prefix="PISHIELD_DB_", extra="ignore")
 
+    # SQLite als Default für einfaches Testen
+    type: str = "sqlite"  # "sqlite" oder "postgresql"
+
+    # SQLite Pfad
+    sqlite_path: str = "data/injectionradar.db"
+
+    # PostgreSQL Settings
     host: str = "localhost"
     port: int = 5432
     name: str = "pishield"
@@ -37,7 +44,16 @@ class DatabaseConfig(BaseSettings):
     @property
     def url(self) -> str:
         """Generiert die Datenbank-URL."""
+        if self.type == "sqlite":
+            return f"sqlite:///{self.sqlite_path}"
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+
+    @property
+    def async_url(self) -> str:
+        """Generiert die async Datenbank-URL."""
+        if self.type == "sqlite":
+            return f"sqlite+aiosqlite:///{self.sqlite_path}"
+        return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
 
 class ScrapingConfig(BaseSettings):

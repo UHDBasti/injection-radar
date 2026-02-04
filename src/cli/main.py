@@ -94,10 +94,14 @@ def init(
 
     try:
         asyncio.run(setup_db())
-        console.print(f"[green]✓[/green] Datenbank initialisiert: {settings.database.host}:{settings.database.port}/{settings.database.name}")
+        if settings.database.type == "sqlite":
+            console.print(f"[green]✓[/green] SQLite Datenbank initialisiert: {settings.database.sqlite_path}")
+        else:
+            console.print(f"[green]✓[/green] PostgreSQL Datenbank initialisiert: {settings.database.host}:{settings.database.port}/{settings.database.name}")
     except Exception as e:
         console.print(f"[red]Fehler bei Datenbankverbindung: {e}[/red]")
-        console.print("[dim]Ist PostgreSQL gestartet? Prüfe die Verbindungsdaten in der config.yaml[/dim]")
+        if settings.database.type == "postgresql":
+            console.print("[dim]Ist PostgreSQL gestartet? Prüfe die Verbindungsdaten in der config.yaml[/dim]")
 
     console.print("\n[bold green]Setup abgeschlossen![/bold green]")
 
@@ -107,97 +111,172 @@ def scan(
     url: str = typer.Argument(..., help="URL zum Scannen"),
     task: str = typer.Option("summarize", "--task", "-t", help="Test-Task (summarize, extract)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Ausführliche Ausgabe"),
+    no_llm: bool = typer.Option(False, "--no-llm", help="Nur Pattern-Analyse ohne LLM (kein API-Key nötig)"),
+    use_httpx: bool = typer.Option(False, "--simple", "-s", help="Einfaches HTTP statt Playwright (schneller)"),
 ):
     """Scannt eine einzelne URL auf Prompt Injection."""
+    mode = "Pattern-Scan" if no_llm else f"LLM-Test ({task})"
     console.print(Panel.fit(
         f"[bold]Scanne:[/bold] {url}",
-        subtitle=f"Task: {task}",
+        subtitle=f"Modus: {mode}",
     ))
 
     settings = get_settings()
+    detector = RedFlagDetector()
 
     async def run_scan():
-        worker = ScraperWorker()
-        await worker.start()
+        if use_httpx:
+            # Einfaches HTTP ohne Playwright
+            import httpx
+            import hashlib
+            from datetime import datetime
+            from ..core.models import ScrapedContent
 
-        try:
-            # Scrapen
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                task_id = progress.add_task("Lade Website...", total=None)
+            async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+                response = await client.get(url)
+                html = response.text
 
+                # Einfache Text-Extraktion
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(html, "lxml")
+                for tag in soup(["script", "style", "noscript"]):
+                    tag.decompose()
+                text = soup.get_text(separator=" ", strip=True)
+
+                content = ScrapedContent(
+                    url_id=0,
+                    http_status=response.status_code,
+                    response_time_ms=0,
+                    raw_html=html,
+                    extracted_text=text,
+                    text_length=len(text),
+                    word_count=len(text.split()),
+                    content_hash=hashlib.sha256(html.encode()).hexdigest(),
+                )
+                return content, None
+        else:
+            # Playwright-basiertes Scraping
+            worker = ScraperWorker()
+            await worker.start()
+            try:
                 content = await worker.scrape_url(url)
+                if not no_llm:
+                    result = await worker.run_llm_test(content, task)
+                    return content, result
+                return content, None
+            finally:
+                await worker.stop()
 
-                progress.update(task_id, description="Analysiere mit LLM...")
+    async def run_simple_scan():
+        # Einfaches HTTP ohne Playwright
+        import httpx
+        import hashlib
+        from ..core.models import ScrapedContent
 
-                # LLM Test
-                result = await worker.run_llm_test(content, task)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            response = await client.get(url)
+            html = response.text
 
-                progress.update(task_id, description="Fertig!")
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "lxml")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            text = soup.get_text(separator=" ", strip=True)
 
-            return content, result
+            return ScrapedContent(
+                url_id=0,
+                http_status=response.status_code,
+                response_time_ms=0,
+                raw_html=html,
+                extracted_text=text,
+                text_length=len(text),
+                word_count=len(text.split()),
+                content_hash=hashlib.sha256(html.encode()).hexdigest(),
+            )
 
-        finally:
-            await worker.stop()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task_id = progress.add_task("Lade Website...", total=None)
 
-    try:
-        content, result = asyncio.run(run_scan())
+        if use_httpx:
+            content = asyncio.run(run_simple_scan())
+            result = None
+        else:
+            content, result = asyncio.run(run_scan())
 
-        # Ergebnisse anzeigen
-        console.print("\n[bold]Scraping-Ergebnis:[/bold]")
-        console.print(f"  HTTP Status: {content.http_status}")
-        console.print(f"  Text-Länge: {content.text_length:,} Zeichen")
-        console.print(f"  Wörter: {content.word_count:,}")
+        progress.update(task_id, description="Analysiere...")
+
+        # Pattern-Analyse auf Website-Text
+        if no_llm:
+            text_flags = detector.detect_all(
+                llm_output=content.extracted_text,
+                tool_calls=[],
+                expected_format="text",
+            )
+            severity = detector.calculate_severity_score(text_flags)
+        else:
+            text_flags = result.flags_detected if result else []
+            severity = detector.calculate_severity_score(text_flags)
+
+        progress.update(task_id, description="Fertig!")
+
+    # Ergebnisse anzeigen
+    console.print("\n[bold]Scraping-Ergebnis:[/bold]")
+    console.print(f"  HTTP Status: {content.http_status}")
+    console.print(f"  Text-Länge: {content.text_length:,} Zeichen")
+    console.print(f"  Wörter: {content.word_count:,}")
+    if hasattr(content, 'external_links') and content.external_links:
         console.print(f"  Externe Links: {len(content.external_links)}")
 
-        console.print("\n[bold]Scan-Ergebnis:[/bold]")
-        console.print(f"  LLM: {result.llm_provider}/{result.llm_model}")
-        console.print(f"  Output-Format: {result.output_format_detected}")
-        console.print(f"  Tool-Calls: {result.tool_calls_count}")
+    if no_llm:
+        console.print("\n[bold]Pattern-Analyse:[/bold]")
+        console.print(f"  Modus: Ohne LLM (Pattern-Matching)")
+        console.print(f"  Severity Score: {severity:.1f}/10")
+    else:
+        console.print("\n[bold]LLM-Scan-Ergebnis:[/bold]")
+        if result:
+            console.print(f"  LLM: {result.llm_provider}/{result.llm_model}")
+            console.print(f"  Output-Format: {result.output_format_detected}")
+            console.print(f"  Tool-Calls: {result.tool_calls_count}")
 
-        # Red Flags
-        if result.flags_detected:
-            console.print(f"\n[bold red]⚠ {len(result.flags_detected)} Red Flag(s) erkannt:[/bold red]")
+    # Red Flags anzeigen
+    flags_to_show = text_flags if no_llm else (result.flags_detected if result else [])
 
-            table = Table(show_header=True, header_style="bold")
-            table.add_column("Typ")
-            table.add_column("Schweregrad")
-            table.add_column("Beschreibung")
+    if flags_to_show:
+        console.print(f"\n[bold red]⚠ {len(flags_to_show)} Red Flag(s) erkannt:[/bold red]")
 
-            severity_colors = {
-                Severity.CRITICAL: "red",
-                Severity.HIGH: "orange1",
-                Severity.MEDIUM: "yellow",
-                Severity.LOW: "blue",
-            }
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Typ")
+        table.add_column("Schweregrad")
+        table.add_column("Beschreibung")
 
-            for flag in result.flags_detected:
-                color = severity_colors.get(flag.severity, "white")
-                table.add_row(
-                    flag.type.value,
-                    f"[{color}]{flag.severity.value}[/{color}]",
-                    flag.description,
-                )
+        severity_colors = {
+            Severity.CRITICAL: "red",
+            Severity.HIGH: "orange1",
+            Severity.MEDIUM: "yellow",
+            Severity.LOW: "blue",
+        }
 
-            console.print(table)
+        for flag in flags_to_show:
+            color = severity_colors.get(flag.severity, "white")
+            table.add_row(
+                flag.type.value,
+                f"[{color}]{flag.severity.value}[/{color}]",
+                flag.description,
+            )
 
-            if verbose and result.flags_detected:
-                console.print("\n[bold]Evidence:[/bold]")
-                for flag in result.flags_detected:
-                    if flag.evidence:
-                        console.print(f"  [{flag.type.value}]: {flag.evidence[:200]}")
-        else:
-            console.print("\n[bold green]✓ Keine Red Flags erkannt[/bold green]")
+        console.print(table)
 
-    except Exception as e:
-        console.print(f"[red]Fehler beim Scannen: {e}[/red]")
         if verbose:
-            import traceback
-            console.print(traceback.format_exc())
-        raise typer.Exit(1)
+            console.print("\n[bold]Evidence:[/bold]")
+            for flag in flags_to_show:
+                if flag.evidence:
+                    console.print(f"  [{flag.type.value}]: {flag.evidence[:200]}")
+    else:
+        console.print("\n[bold green]✓ Keine Red Flags erkannt[/bold green]")
 
 
 @app.command()

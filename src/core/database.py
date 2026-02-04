@@ -18,7 +18,18 @@ from sqlalchemy import (
     Text,
     create_engine,
 )
+from sqlalchemy import JSON
 from sqlalchemy.dialects.postgresql import JSONB
+
+# Verwende JSON für SQLite-Kompatibilität, JSONB für PostgreSQL
+def get_json_type(url: str):
+    """Gibt den richtigen JSON-Typ basierend auf der DB zurück."""
+    if "postgresql" in url:
+        return JSONB
+    return JSON
+
+# Default zu JSON für SQLite-Kompatibilität
+JSONType = JSON
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, relationship, sessionmaker
 
@@ -108,9 +119,9 @@ class ScrapedContentDB(Base):
     word_count = Column(Integer, nullable=False)
 
     # Extrahierte Elemente (JSONB für PostgreSQL)
-    meta_tags = Column(JSONB, default=dict, nullable=False)
-    scripts_content = Column(JSONB, default=list, nullable=False)
-    external_links = Column(JSONB, default=list, nullable=False)
+    meta_tags = Column(JSON, default=dict, nullable=False)
+    scripts_content = Column(JSON, default=list, nullable=False)
+    external_links = Column(JSON, default=list, nullable=False)
 
     # Hash
     content_hash = Column(String(64), nullable=False)
@@ -175,7 +186,7 @@ class LLMResponseDB(Base):
     finish_reason = Column(String(50), nullable=False)
 
     # Tool Calls (Red Flag!)
-    tool_calls = Column(JSONB, default=list, nullable=False)
+    tool_calls = Column(JSON, default=list, nullable=False)
     has_tool_calls = Column(Boolean, default=False, nullable=False)
 
     # Relationships
@@ -205,7 +216,7 @@ class ScanResultDB(Base):
     tool_calls_count = Column(Integer, default=0, nullable=False)
 
     # Red Flags (JSONB für flexible Struktur)
-    flags_detected = Column(JSONB, default=list, nullable=False)
+    flags_detected = Column(JSON, default=list, nullable=False)
 
     # Metriken
     format_match_score = Column(Float, default=0.0, nullable=False)
@@ -241,7 +252,7 @@ class AnalysisResultDB(Base):
     severity_score = Column(Float, nullable=False)
 
     # Details
-    flags_triggered = Column(JSONB, default=list, nullable=False)
+    flags_triggered = Column(JSON, default=list, nullable=False)
     reasoning = Column(Text, nullable=False)
 
     # Timestamps
@@ -281,11 +292,18 @@ class CrawlCheckpointDB(Base):
 
 def get_sync_engine(database_url: str):
     """Erstellt eine synchrone Engine."""
+    if "sqlite" in database_url:
+        return create_engine(database_url, connect_args={"check_same_thread": False})
     return create_engine(database_url, pool_pre_ping=True)
 
 
 def get_async_engine(database_url: str):
     """Erstellt eine asynchrone Engine."""
+    if "sqlite" in database_url:
+        # SQLite async URL
+        async_url = database_url.replace("sqlite:///", "sqlite+aiosqlite:///")
+        return create_async_engine(async_url)
+    # PostgreSQL async URL
     async_url = database_url.replace("postgresql://", "postgresql+asyncpg://")
     return create_async_engine(async_url, pool_pre_ping=True)
 
