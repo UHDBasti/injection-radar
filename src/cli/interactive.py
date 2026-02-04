@@ -2,6 +2,7 @@
 Interaktives CLI für InjectionRadar.
 
 Bietet eine benutzerfreundliche Shell-Erfahrung ähnlich wie Claude Code.
+Startet automatisch alle benötigten Backend-Services.
 """
 
 import asyncio
@@ -29,11 +30,12 @@ from ..core.logging import (
     get_recent_logs,
     LOG_DIR,
 )
+from ..core.startup import auto_start_services, ensure_local_requirements, StartupManager
 
 console = Console()
 
 # Logger initialisieren
-logger = setup_logging(level="DEBUG")
+logger = setup_logging(level="INFO")  # INFO statt DEBUG für weniger Noise
 
 # Konfigurationspfad (wie Claude Code in ~/.config/)
 CONFIG_DIR = Path.home() / ".injection-radar"
@@ -191,6 +193,12 @@ def show_status(config: dict):
     table.add_column("Key", style="bold")
     table.add_column("Value")
 
+    # Architektur-Modus
+    if config.get("use_local_mode"):
+        table.add_row("Architektur", "[yellow]Lokal[/yellow] (kein Docker)")
+    else:
+        table.add_row("Architektur", "[green]Zwei-System[/green] (Docker)")
+
     # Provider
     provider = config.get("provider", "none")
     provider_display = {
@@ -215,12 +223,10 @@ def show_status(config: dict):
         table.add_row("OpenAI Key", "[red]✗ Nicht konfiguriert[/red]")
 
     # Datenbank
-    db_type = config.get("database_type", "sqlite")
-    if db_type == "sqlite":
+    if config.get("use_local_mode"):
         table.add_row("Datenbank", "[green]SQLite[/green] (lokal)")
     else:
-        host = config.get("db_host", "localhost")
-        table.add_row("Datenbank", f"[green]PostgreSQL[/green] ({host})")
+        table.add_row("Datenbank", "[green]PostgreSQL[/green] (Docker)")
 
     # Modelle
     if config.get("anthropic_model"):
@@ -239,33 +245,35 @@ def show_help():
 
 | Befehl | Beschreibung |
 |--------|--------------|
-| `scan <url>` | Scannt eine URL via Orchestrator-API |
-| `scan <url> --local` | Lokaler Scan ohne Docker/Redis |
-| `scan <url> --quick` | Schneller Scan ohne LLM (nur Patterns) |
+| `scan <url>` | Scannt eine URL (automatisch bester Modus) |
+| `scan <url> --local` | Lokaler Scan ohne Docker |
+| `scan <url> --quick` | Schneller Scan ohne LLM |
 | `status` | Zeigt den aktuellen Status |
+| `services` | Zeigt Docker-Service-Status |
+| `restart` | Startet alle Services neu |
 | `config` | Öffnet den Konfigurations-Wizard |
 | `logs` | Zeigt die letzten Log-Einträge |
 | `logs -f` | Zeigt Pfad zur Log-Datei |
-| `history` | Zeigt letzte Scans |
 | `help` | Diese Hilfe |
 | `exit` / `quit` | Beendet InjectionRadar |
 
-## Architektur-Modi
+## Automatischer Start
 
-- **Standard**: Nutzt Orchestrator-API (Zwei-System-Architektur)
-  - Sichere Isolation: Rohdaten bleiben im Scraper-Subsystem
-  - Benötigt Docker + Redis
+Beim Start von `injection-radar` werden automatisch alle Docker-Services gestartet:
+- PostgreSQL (Datenbank)
+- Redis (Job Queue)
+- Orchestrator (API Server)
+- Scraper (Sandbox Worker)
 
-- **--local**: Lokaler Modus (für Entwicklung)
-  - Alles läuft im selben Prozess
-  - Keine Sandbox-Isolation!
+Falls Docker nicht verfügbar ist, wird automatisch der lokale Modus verwendet.
 
 ## Beispiele
 
 ```
-> scan https://example.com            # Via API
-> scan https://example.com --local    # Lokal (Entwicklung)
-> scan https://bad-site.com --quick   # Nur Pattern-Check
+> scan https://example.com            # Automatisch via Docker
+> scan https://example.com --local    # Erzwinge lokalen Modus
+> services                            # Zeige Container-Status
+> restart                             # Services neu starten
 ```
 
 ## Tastenkürzel
@@ -274,6 +282,40 @@ def show_help():
 - `Ctrl+D` - InjectionRadar beenden
 """
     console.print(Markdown(help_text))
+
+
+def show_services_status():
+    """Zeigt den Status der Docker-Services."""
+    manager = StartupManager()
+
+    if not manager.check_docker():
+        console.print("[yellow]Docker nicht verfügbar[/yellow]")
+        return
+
+    all_running, status = manager.are_containers_running()
+
+    table = Table(title="Docker Services", show_header=True)
+    table.add_column("Service")
+    table.add_column("Status")
+
+    for service, running in status.items():
+        if running:
+            table.add_row(service, "[green]● Läuft[/green]")
+        else:
+            table.add_row(service, "[red]○ Gestoppt[/red]")
+
+    console.print(table)
+
+    # Queue-Status wenn möglich
+    if status.get("redis"):
+        try:
+            import httpx
+            response = httpx.get("http://localhost:8000/queue/stats", timeout=2)
+            if response.status_code == 200:
+                data = response.json()
+                console.print(f"\n[dim]Jobs in Queue: {data.get('queue_length', 0)}[/dim]")
+        except Exception:
+            pass
 
 
 def show_logs(show_path: bool = False):
@@ -672,8 +714,12 @@ async def do_scan(url: str, config: dict, quick: bool = False, local: bool = Fal
 
 
 def interactive_shell():
-    """Startet die interaktive Shell."""
+    """Startet die interaktive Shell mit automatischem Service-Start."""
     log_info("interactive_shell_started")
+
+    # Banner zuerst
+    console.print(get_banner())
+
     config = load_config()
 
     # Erstes Setup wenn nötig
@@ -681,10 +727,23 @@ def interactive_shell():
         log_info("running_setup_wizard")
         config = setup_wizard()
 
-    # Banner
-    console.print(get_banner())
+    # =========================================================================
+    # AUTOMATISCHER SERVICE-START
+    # =========================================================================
+    services_ready, use_local = auto_start_services(console)
 
-    # Status
+    if use_local:
+        # Lokaler Modus - stelle sicher dass SQLite etc. bereit ist
+        ensure_local_requirements()
+        config["use_local_mode"] = True
+        console.print("[dim]Modus: Lokal (SQLite, kein Docker)[/dim]")
+    else:
+        config["use_local_mode"] = False
+        console.print("[dim]Modus: Zwei-System-Architektur (Docker)[/dim]")
+
+    console.print()
+
+    # Status anzeigen
     show_status(config)
 
     # Hilfe-Hinweis
@@ -736,6 +795,20 @@ def interactive_shell():
 
             elif command == "history":
                 console.print("[dim]History-Feature kommt bald...[/dim]")
+
+            elif command == "services":
+                show_services_status()
+
+            elif command == "restart":
+                # Services neu starten
+                console.print("[dim]Starte Services neu...[/dim]")
+                manager = StartupManager()
+                if manager.check_docker():
+                    manager.stop_containers()
+                    services_ready, use_local = auto_start_services(console)
+                    config["use_local_mode"] = use_local
+                else:
+                    console.print("[yellow]Docker nicht verfügbar[/yellow]")
 
             else:
                 console.print(f"[red]Unbekannter Befehl: {command}[/red]")
