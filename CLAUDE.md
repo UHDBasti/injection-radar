@@ -11,7 +11,7 @@
 
 ### Kernkonzept
 ```
-Website → Scraper → Test-LLM (wird Injection ausgesetzt) → Analyse → Datenbank
+Website → Scraper (Docker) → Test-LLM → Red-Flag Detection → Klassifizierung → Datenbank
 ```
 
 ---
@@ -23,14 +23,14 @@ Website → Scraper → Test-LLM (wird Injection ausgesetzt) → Analyse → Dat
 ### Hauptsystem (Orchestrator)
 - **DARF NIEMALS** gescrapte Rohdaten (HTML, Text) verarbeiten
 - Sieht **NUR** strukturierte Reports vom Subsystem
-- Analysiert Reports und klassifiziert Ergebnisse
-- Schreibt in die Datenbank
+- Kommuniziert via Redis Queue mit dem Subsystem
+- Speichert Klassifizierungen in der Datenbank
 
-### Subsystem (Sandbox)
-- Läuft in isolierten Docker-Containern
-- Scraped Websites und führt LLM-Tests durch
+### Subsystem (Scraper in Docker)
+- Läuft in isolierten Docker-Containern (read-only, no-new-privileges)
+- Scraped Websites mit Playwright und führt LLM-Tests durch
 - Speichert Rohdaten **DIREKT** in die Datenbank
-- Gibt nur `ScanResult` (strukturierter Report) ans Hauptsystem zurück
+- Gibt nur `JobResult` (strukturierter Report) ans Hauptsystem zurück
 
 **Grund:** Wenn das Hauptsystem Rohdaten verarbeiten würde, könnte es selbst Opfer von Prompt Injection werden!
 
@@ -42,14 +42,9 @@ Website → Scraper → Test-LLM (wird Injection ausgesetzt) → Analyse → Dat
 injection-radar/
 ├── CLAUDE.md              # Diese Datei (für Claude Code)
 ├── README.md              # Projekt-Dokumentation
+├── pyproject.toml         # Python Package Config
 ├── requirements.txt       # Python Dependencies
-├── LICENSE                # MIT Lizenz
-│
-├── config/
-│   └── config.example.yaml    # Beispiel-Konfiguration
-│
-├── data/
-│   └── top-1m.csv            # Tranco Domain-Liste (1M URLs)
+├── .env                   # API Keys (nicht committen!)
 │
 ├── docker/
 │   ├── docker-compose.yml     # Komplettes Docker Setup
@@ -59,70 +54,89 @@ injection-radar/
 ├── src/
 │   ├── core/                  # Kernlogik
 │   │   ├── models.py          # Pydantic Datenmodelle
-│   │   └── config.py          # Konfigurationsmanagement
+│   │   ├── config.py          # Konfigurationsmanagement
+│   │   ├── database.py        # SQLAlchemy Models
+│   │   ├── queue.py           # Redis Job Queue
+│   │   ├── logging.py         # Strukturiertes Logging
+│   │   └── startup.py         # Docker Service Management
 │   │
 │   ├── scraper/               # Web-Scraping (Subsystem)
-│   │   └── worker.py          # TODO: Scraper-Worker
+│   │   └── worker.py          # Playwright Scraper Worker
 │   │
 │   ├── llm/                   # LLM-Provider
-│   │   ├── base.py            # TODO: Base-Klasse
-│   │   ├── anthropic.py       # TODO: Claude Integration
-│   │   └── openai.py          # TODO: OpenAI Integration
+│   │   ├── base.py            # Base-Klasse
+│   │   ├── anthropic.py       # Claude Integration
+│   │   └── openai.py          # OpenAI Integration
 │   │
 │   ├── analysis/              # Red-Flag Detection
-│   │   └── detector.py        # TODO: Analyse-Logik
+│   │   └── detector.py        # Pattern-Analyse
 │   │
 │   ├── cli/                   # Command Line Interface
-│   │   └── main.py            # TODO: CLI Tool
+│   │   ├── main.py            # Typer CLI
+│   │   └── interactive.py     # Interaktive Shell
 │   │
-│   └── api/                   # REST API
-│       └── main.py            # TODO: FastAPI Server
+│   ├── api/                   # REST API (Orchestrator)
+│   │   └── main.py            # FastAPI Server
+│   │
+│   └── mcp/                   # MCP Server für AI-Tools
+│       └── server.py          # MCP Integration
 │
 └── tests/                     # Tests
 ```
 
 ---
 
-## 🔧 Wichtige Datenmodelle
+## 🚀 Verwendung
 
-### `ScanResult` - Der strukturierte Report
-```python
-class ScanResult(BaseModel):
-    """Das EINZIGE was das Hauptsystem vom Subsystem bekommt!"""
-    url_id: int
-    task_name: str  # z.B. "summarize"
+### Starten
+```bash
+# Interaktive Shell (startet automatisch Docker Services)
+injection-radar
 
-    # LLM Info
-    llm_provider: str
-    llm_model: str
-
-    # Output-Analyse (KEIN Rohtext!)
-    output_length: int
-    output_word_count: int
-    output_format_detected: str
-
-    # Red Flags
-    tool_calls_attempted: bool
-    tool_calls_count: int
-    flags_detected: list[RedFlag]
-
-    # Metriken
-    format_match_score: float
-    expected_vs_actual_length_ratio: float
+# Oder direkt mit Typer CLI
+injection-radar scan https://example.com
 ```
 
-### `RedFlag` - Erkannte Probleme
+### CLI-Befehle
+| Befehl | Beschreibung |
+|--------|--------------|
+| `scan <url>` | Scannt eine URL |
+| `scan <url1> <url2> ...` | Scannt mehrere URLs parallel (max 10) |
+| `scan list <file.csv>` | Scannt URLs aus einer CSV-Datei |
+| `scan <url> --local` | Lokaler Scan ohne Docker |
+| `scan <url> --quick` | Schneller Pattern-Scan ohne LLM |
+| `history [n]` | Zeigt die letzten n Scans |
+| `status` | Zeigt den aktuellen Status |
+| `services` | Zeigt Docker-Service-Status |
+| `config` | Öffnet den Konfigurations-Wizard |
+
+### API Endpoints
+| Endpoint | Methode | Beschreibung |
+|----------|---------|--------------|
+| `/scan` | POST | Scannt eine URL |
+| `/history` | GET | Scan-Historie |
+| `/url/status` | GET | Status einer URL |
+| `/domains/dangerous` | GET | Gefährliche Domains |
+| `/health` | GET | Health Check |
+
+---
+
+## 🔧 Wichtige Datenmodelle
+
+### `JobResult` - Report vom Subsystem
 ```python
-class RedFlagType(str, Enum):
-    TOOL_CALL = "tool_call"              # 🔴 CRITICAL
-    CODE_EXECUTION = "code_execution"    # 🔴 CRITICAL
-    SYSTEM_PROMPT_LEAK = "system_prompt_leak"  # 🟠 HIGH
-    DIRECT_INSTRUCTIONS = "direct_instructions"  # 🟠 HIGH
-    FORMAT_DEVIATION = "format_deviation"  # 🟡 MEDIUM
-    EXTERNAL_URLS = "external_urls"      # 🟡 MEDIUM
-    UNEXPECTED_DATA = "unexpected_data"  # 🟡 MEDIUM
-    HALLUCINATION = "hallucination"      # 🔵 LOW
-    SENTIMENT_SHIFT = "sentiment_shift"  # 🔵 LOW
+class JobResult(BaseModel):
+    """Ergebnis eines Scan-Jobs (nur strukturierte Daten!)."""
+    job_id: str
+    url: str
+    status: str  # "completed", "failed", "timeout"
+    severity_score: float
+    flags_count: int
+    flags: list[dict]
+    classification: str  # "safe", "suspicious", "dangerous"
+    llm_provider: str
+    llm_model: str
+    processing_time_ms: int
 ```
 
 ### `Classification` - Ergebnis
@@ -135,23 +149,76 @@ class Classification(str, Enum):
     PENDING = "pending"     # ⏳ Noch nicht gescannt
 ```
 
+### `RedFlagType` - Erkannte Probleme
+```python
+class RedFlagType(str, Enum):
+    TOOL_CALL = "tool_call"              # 🔴 CRITICAL
+    CODE_EXECUTION = "code_execution"    # 🔴 CRITICAL
+    SYSTEM_PROMPT_LEAK = "system_prompt_leak"  # 🟠 HIGH
+    DIRECT_INSTRUCTIONS = "direct_instructions"  # 🟠 HIGH
+    FORMAT_DEVIATION = "format_deviation"  # 🟡 MEDIUM
+    EXTERNAL_URLS = "external_urls"      # 🟡 MEDIUM
+    HALLUCINATION = "hallucination"      # 🔵 LOW
+    SENTIMENT_SHIFT = "sentiment_shift"  # 🔵 LOW
+```
+
 ---
 
-## 🚀 Entwicklungs-Tasks
+## 🐳 Docker Services
 
-### Priorität 1 (Kern-Funktionalität)
-1. **Datenbank-Schema** - SQLAlchemy Models für PostgreSQL
-2. **Scraper-Worker** - Playwright Integration in Docker
-3. **LLM-Client** - Anthropic SDK Wrapper
-4. **Red-Flag Detector** - Analyse-Logik
+```bash
+# Services werden automatisch beim Start von injection-radar gestartet
 
-### Priorität 2 (Usability)
-5. **CLI-Tool** - Interaktive Einrichtung, Scan-Befehle
-6. **Checkpoint-System** - Fortschritt speichern/fortsetzen
+# Manuell starten
+cd docker && docker compose up -d
 
-### Priorität 3 (API)
-7. **REST API** - FastAPI für externe Abfragen
-8. **Rate Limiting** - Schutz vor Überlastung
+# Logs anzeigen
+docker compose logs -f orchestrator
+
+# Status prüfen
+docker compose ps
+
+# Alles stoppen
+docker compose down
+
+# Volumes löschen (Datenbank reset)
+docker compose down -v
+```
+
+### Container
+| Container | Port | Beschreibung |
+|-----------|------|--------------|
+| pishield-db | 5432 | PostgreSQL Datenbank |
+| pishield-redis | 6379 | Redis Job Queue |
+| pishield-orchestrator | 8000 | FastAPI Orchestrator |
+| docker-scraper-1/2 | - | Playwright Scraper Workers |
+
+---
+
+## 📊 Datenbank
+
+### Wichtige Tabellen
+- `domains` - Aggregierte Domain-Statistiken
+- `urls` - Einzelne URLs mit Status
+- `scraped_content` - Rohdaten (nur Subsystem!)
+- `scan_results` - Strukturierte Reports
+- `analysis_results` - Finale Klassifizierungen
+
+### Direkter Zugriff
+```bash
+docker exec -it pishield-db psql -U pishield -d pishield
+```
+
+---
+
+## 🔐 Sicherheitsregeln
+
+1. **NIEMALS** API-Keys in Code oder Commits
+2. **NIEMALS** Rohdaten im Hauptsystem verarbeiten
+3. **IMMER** strukturierte Reports verwenden
+4. **IMMER** Input validieren (Pydantic)
+5. **IMMER** Sandbox-Container isoliert halten
+6. **IMMER** `datetime.utcnow()` für DB-Timestamps (nicht timezone-aware!)
 
 ---
 
@@ -164,117 +231,42 @@ class Classification(str, Enum):
 - async/await für I/O-Operationen
 - Docstrings im Google-Style
 
-### Beispiel
-```python
-async def analyze_scan_result(
-    result: ScanResult,
-    settings: Settings,
-) -> AnalysisResult:
-    """Analysiert einen Scan-Report und klassifiziert das Ergebnis.
-
-    Args:
-        result: Der strukturierte Report vom Subsystem.
-        settings: Anwendungskonfiguration.
-
-    Returns:
-        AnalysisResult mit Klassifizierung und Reasoning.
-
-    Raises:
-        AnalysisError: Wenn die Analyse fehlschlägt.
-    """
-    # Implementation...
-```
-
 ### Naming
 - Dateien: `snake_case.py`
 - Klassen: `PascalCase`
 - Funktionen/Variablen: `snake_case`
 - Konstanten: `UPPER_SNAKE_CASE`
 
----
-
-## 🔐 Sicherheitsregeln
-
-1. **NIEMALS** API-Keys in Code oder Commits
-2. **NIEMALS** Rohdaten im Hauptsystem verarbeiten
-3. **IMMER** strukturierte Reports verwenden
-4. **IMMER** Input validieren (Pydantic)
-5. **IMMER** Sandbox-Container isoliert halten
-
----
-
-## 🧪 Testen
-
-```bash
-# Unit Tests
-pytest tests/
-
-# Mit Coverage
-pytest --cov=src tests/
-
-# Einzelnen Test
-pytest tests/test_analysis.py -v
-```
-
----
-
-## 🐳 Docker Befehle
-
-```bash
-# Alles starten
-cd docker && docker-compose up -d
-
-# Logs anzeigen
-docker-compose logs -f orchestrator
-
-# Scraper skalieren (max 10)
-docker-compose up -d --scale scraper=5
-
-# Alles stoppen
-docker-compose down
-```
-
----
-
-## 📊 Datenbank
-
-### Verbindung
-```python
-from src.core.config import get_settings
-
-settings = get_settings()
-db_url = settings.database.url
-# postgresql://user:pass@localhost:5432/injectionradar
-```
-
-### Wichtige Tabellen
-- `domains` - Aggregierte Domain-Statistiken
-- `urls` - Einzelne URLs mit Status
-- `scraped_content` - Rohdaten (nur Subsystem!)
-- `scan_results` - Strukturierte Reports
-- `analysis_results` - Finale Klassifizierungen
-- `crawl_checkpoints` - Fortschritts-Tracking
+### Bekannte Fallstricke
+- PostgreSQL `TIMESTAMP WITHOUT TIME ZONE` braucht naive datetimes (`datetime.utcnow()`)
+- `dict.get(key, default)` gibt default nur zurück wenn key nicht existiert, nicht wenn value `None` ist
+- Nutze `value = result.get("key") or []` statt `result.get("key", [])`
 
 ---
 
 ## 🎯 Aktueller Status
 
-**Phase:** Prototyp-Entwicklung
+**Phase:** Funktionsfähiger Prototyp
 
 **Erledigt:**
-- [x] Projektstruktur
-- [x] Datenmodelle (Pydantic)
-- [x] Konfigurationsmanagement
-- [x] Docker-Setup
-- [x] Domain-Liste (Tranco 1M)
+- [x] Zwei-System-Architektur mit Docker
+- [x] Redis Job Queue
+- [x] Playwright Scraper in Sandbox
+- [x] LLM Integration (Anthropic, OpenAI)
+- [x] Red-Flag Detection
+- [x] Interaktive CLI Shell
+- [x] REST API (FastAPI)
+- [x] Paralleles Scannen (bis zu 10 URLs)
+- [x] CSV Batch Import
+- [x] History Command
+- [x] MCP Server für AI-Tools
+- [x] Automatischer Docker Service Start
 
 **Offen:**
-- [ ] Datenbank-Schema (SQLAlchemy)
-- [ ] Scraper-Worker
-- [ ] LLM-Integration
-- [ ] Red-Flag Detection
-- [ ] CLI-Tool
-- [ ] API
+- [ ] Rate Limiting
+- [ ] Checkpoint-System für große Crawls
+- [ ] Web Dashboard
+- [ ] Scheduled Scans
 
 ---
 
@@ -282,10 +274,11 @@ db_url = settings.database.url
 
 Wenn du an diesem Projekt arbeitest:
 
-1. **Lies immer zuerst** `src/core/models.py` um die Datenstrukturen zu verstehen
+1. **Lies immer zuerst** `src/core/models.py` und `src/core/queue.py`
 2. **Beachte die Sicherheitsarchitektur** - Hauptsystem sieht keine Rohdaten!
 3. **Nutze Pydantic** für alle Datenvalidierung
 4. **Schreibe async Code** für I/O-Operationen
-5. **Teste deinen Code** bevor du ihn als fertig markierst
+5. **Teste mit Docker** - `docker compose up -d` vor dem Testen
+6. **Nutze naive datetimes** für PostgreSQL (`datetime.utcnow()`)
 
 Bei Fragen zur Architektur: Frag nach, bevor du implementierst!
