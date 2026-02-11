@@ -19,6 +19,8 @@ from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.markdown import Markdown
 
+from .debug_dashboard import DebugDashboard
+
 from ..core.logging import (
     setup_logging,
     log_info,
@@ -250,6 +252,8 @@ def show_help():
 | `scan list <file.csv>` | Scannt URLs aus einer CSV-Datei |
 | `scan <url> --local` | Lokaler Scan ohne Docker |
 | `scan <url> --quick` | Schneller Scan ohne LLM |
+| `scan <url> --debug` | Scan mit Live Debug Dashboard |
+| `debug on` / `debug off` | Debug-Modus ein/ausschalten |
 | `history [n]` | Zeigt die letzten n Scans (Standard: 20) |
 | `status` | Zeigt den aktuellen Status |
 | `services` | Zeigt Docker-Service-Status |
@@ -274,9 +278,12 @@ Falls Docker nicht verfügbar ist, wird automatisch der lokale Modus verwendet.
 
 ```
 > scan https://example.com            # Automatisch via Docker
+> scan https://example.com --debug    # Mit Live Debug Dashboard
 > scan https://example.com --local    # Erzwinge lokalen Modus
+> debug on                            # Debug-Modus dauerhaft an
+> scan example.com google.com         # Paralleler Debug-Scan
+> debug off                           # Debug-Modus aus
 > services                            # Zeige Container-Status
-> restart                             # Services neu starten
 ```
 
 ## Tastenkürzel
@@ -1028,6 +1035,7 @@ def interactive_shell():
     console.print(get_banner())
 
     config = load_config()
+    debug_mode = False  # Globaler Debug-Toggle
 
     # Erstes Setup wenn nötig
     if not config or not config.get("provider"):
@@ -1087,6 +1095,19 @@ def interactive_shell():
                 elif command == "config":
                     config = setup_wizard()
 
+                elif command == "debug":
+                    if args and args[0].lower() == "on":
+                        debug_mode = True
+                        console.print("[green]Debug-Modus aktiviert[/green]")
+                        console.print("[dim]Alle Scans zeigen jetzt das Live-Dashboard[/dim]")
+                    elif args and args[0].lower() == "off":
+                        debug_mode = False
+                        console.print("[yellow]Debug-Modus deaktiviert[/yellow]")
+                    else:
+                        status = "[green]an[/green]" if debug_mode else "[dim]aus[/dim]"
+                        console.print(f"Debug-Modus: {status}")
+                        console.print("[dim]Verwendung: debug on / debug off[/dim]")
+
                 elif command == "scan":
                     if not args:
                         console.print("[red]Bitte gib eine URL an: scan <url> [url2] [url3] ...[/red]")
@@ -1095,6 +1116,7 @@ def interactive_shell():
 
                     quick = "--quick" in args or "-q" in args
                     local = "--local" in args or "-l" in args
+                    use_debug = debug_mode or "--debug" in args or "-d" in args
 
                     # Spezialfall: scan list <file>
                     if args[0] == "list":
@@ -1118,7 +1140,11 @@ def interactive_shell():
                                 console.print(f"[dim]Für mehr URLs: Teile die Datei auf oder erhöhe das Limit[/dim]")
                                 urls = urls[:limit]
 
-                            loop.run_until_complete(do_scan_multiple(urls, config))
+                            if use_debug and not local:
+                                dashboard = DebugDashboard(config, console)
+                                loop.run_until_complete(dashboard.run(urls))
+                            else:
+                                loop.run_until_complete(do_scan_multiple(urls, config))
                         except FileNotFoundError as e:
                             console.print(f"[red]{e}[/red]")
                         except Exception as e:
@@ -1135,7 +1161,11 @@ def interactive_shell():
                             url = "https://" + url
                         normalized_urls.append(url)
 
-                    if len(normalized_urls) == 1:
+                    if use_debug and not local:
+                        # Debug Dashboard fuer alle Scans (auch Einzel-Scans)
+                        dashboard = DebugDashboard(config, console)
+                        loop.run_until_complete(dashboard.run(normalized_urls))
+                    elif len(normalized_urls) == 1:
                         # Einzelner Scan
                         loop.run_until_complete(do_scan(normalized_urls[0], config, quick, local))
                     else:
