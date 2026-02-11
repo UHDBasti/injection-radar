@@ -140,54 +140,174 @@ else
 fi
 
 # ============================================================================
-# 6. Docker/PostgreSQL Setup (optional)
+# 6. Docker Installation und Setup
 # ============================================================================
 log_info "Prüfe Docker Installation..."
 
 DOCKER_AVAILABLE=false
+
+# Funktion um Docker zu installieren
+install_docker() {
+    log_info "Installiere Docker..."
+
+    # Alte Versionen entfernen
+    sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
+
+    # Dependencies installieren
+    sudo apt-get update
+    sudo apt-get install -y \
+        ca-certificates \
+        curl \
+        gnupg \
+        lsb-release
+
+    # Docker GPG Key hinzufügen
+    sudo mkdir -p /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+    # Docker Repository hinzufügen
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+      $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    # Docker installieren
+    sudo apt-get update
+    sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+    # User zur docker Gruppe hinzufügen
+    sudo usermod -aG docker $USER
+
+    # Docker starten
+    sudo systemctl start docker
+    sudo systemctl enable docker
+
+    log_success "Docker installiert"
+    log_warn "WICHTIG: Bitte einmal aus- und wieder einloggen, damit die docker-Gruppe aktiv wird!"
+    log_warn "Oder führe aus: newgrp docker"
+}
+
+# Prüfe ob Docker installiert ist
 if command -v docker &> /dev/null; then
+    # Docker ist installiert, prüfe ob es läuft
     if docker info &> /dev/null; then
         DOCKER_AVAILABLE=true
-        log_success "Docker verfügbar"
+        log_success "Docker verfügbar und läuft"
     else
-        log_warn "Docker installiert aber nicht erreichbar (Daemon läuft nicht oder keine Rechte)"
+        # Docker installiert aber läuft nicht - versuche zu starten
+        log_warn "Docker installiert aber nicht erreichbar"
+
+        # Versuche Docker zu starten
+        if command -v sudo &> /dev/null; then
+            log_info "Versuche Docker zu starten..."
+            sudo systemctl start docker 2>/dev/null || true
+            sleep 2
+
+            # Prüfe ob User in docker Gruppe ist
+            if ! groups | grep -q docker; then
+                log_info "Füge User zur docker-Gruppe hinzu..."
+                sudo usermod -aG docker $USER
+                log_warn "Bitte führe 'newgrp docker' aus oder logge dich neu ein"
+            fi
+
+            # Nochmal prüfen
+            if docker info &> /dev/null; then
+                DOCKER_AVAILABLE=true
+                log_success "Docker gestartet"
+            else
+                # Versuche mit newgrp
+                log_info "Versuche Docker mit newgrp..."
+                if sg docker -c "docker info" &> /dev/null; then
+                    DOCKER_AVAILABLE=true
+                    log_success "Docker verfügbar (via docker-Gruppe)"
+                fi
+            fi
+        fi
     fi
 else
+    # Docker nicht installiert
     log_warn "Docker nicht installiert"
+
+    # Frage ob installiert werden soll
+    if command -v sudo &> /dev/null && command -v apt-get &> /dev/null; then
+        echo ""
+        echo -e "${YELLOW}Docker wird für die Zwei-System-Architektur benötigt.${NC}"
+        echo -e "${YELLOW}Ohne Docker läuft InjectionRadar im lokalen Modus (weniger sicher).${NC}"
+        echo ""
+        read -p "Docker jetzt installieren? [j/N] " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Jj]$ ]]; then
+            install_docker
+
+            # Nach Installation nochmal prüfen (mit newgrp)
+            if sg docker -c "docker info" &> /dev/null; then
+                DOCKER_AVAILABLE=true
+            fi
+        fi
+    else
+        log_warn "Automatische Docker-Installation nicht möglich"
+        log_info "Installiere Docker manuell: https://docs.docker.com/engine/install/"
+    fi
 fi
 
 if [ "$DOCKER_AVAILABLE" = true ]; then
-    log_info "Starte PostgreSQL Container..."
+    log_info "Starte alle Docker Services (DB, Redis)..."
 
-    # Prüfe ob Container bereits läuft
-    if docker ps --format '{{.Names}}' | grep -q "^injectionradar-db$"; then
-        log_warn "PostgreSQL Container läuft bereits"
-    elif docker ps -a --format '{{.Names}}' | grep -q "^injectionradar-db$"; then
-        log_info "Starte existierenden Container..."
-        docker start injectionradar-db
-        log_success "PostgreSQL Container gestartet"
+    # Setze Umgebungsvariablen für docker-compose
+    export DB_PASSWORD="pishield123"
+    export PISHIELD_DB_PASSWORD="pishield123"
+
+    # Lade API Keys aus .env wenn vorhanden
+    if [ -f ".env" ]; then
+        set -a
+        source .env 2>/dev/null || true
+        set +a
+    fi
+
+    # Prüfe ob User docker ohne sudo ausführen kann
+    if docker info &> /dev/null; then
+        DOCKER_CMD="docker"
+        COMPOSE_CMD="docker compose"
     else
-        log_info "Erstelle neuen PostgreSQL Container..."
-        docker run -d \
-            --name injectionradar-db \
-            -e POSTGRES_USER=pishield \
-            -e POSTGRES_PASSWORD=pishield123 \
-            -e POSTGRES_DB=pishield \
-            -p 5432:5432 \
-            --health-cmd="pg_isready -U pishield" \
-            --health-interval=10s \
-            --health-timeout=5s \
-            --health-retries=5 \
-            postgres:16-alpine \
-            > /dev/null
+        # Braucht sudo (User noch nicht in docker-Gruppe)
+        log_info "Docker braucht sudo (Gruppe wird erst nach Neuanmeldung aktiv)"
+        DOCKER_CMD="sudo docker"
+        COMPOSE_CMD="sudo docker compose"
+    fi
+
+    # Prüfe ob Services bereits laufen
+    if $DOCKER_CMD ps --format '{{.Names}}' 2>/dev/null | grep -q "pishield-db"; then
+        log_warn "Services laufen bereits"
+    else
+        # Alte einzelne Container entfernen (falls vorhanden)
+        $DOCKER_CMD rm -f injectionradar-db 2>/dev/null || true
+
+        log_info "Baue und starte Docker Services..."
+
+        cd docker
+
+        # Nur DB und Redis beim Install starten (schneller)
+        if $COMPOSE_CMD up -d db redis 2>&1 | tee /tmp/compose-output.log; then
+            log_success "Basis-Services gestartet (DB, Redis)"
+        else
+            log_error "Docker Compose fehlgeschlagen:"
+            cat /tmp/compose-output.log
+        fi
+
+        cd ..
 
         log_info "Warte auf PostgreSQL..."
-        sleep 5
-
-        # Warte bis healthy
         for i in {1..30}; do
-            if docker exec injectionradar-db pg_isready -U pishield &> /dev/null; then
+            if $DOCKER_CMD exec pishield-db pg_isready -U pishield &> /dev/null; then
                 log_success "PostgreSQL ist bereit"
+                break
+            fi
+            sleep 1
+        done
+
+        log_info "Warte auf Redis..."
+        for i in {1..10}; do
+            if $DOCKER_CMD exec pishield-redis redis-cli ping &> /dev/null; then
+                log_success "Redis ist bereit"
                 break
             fi
             sleep 1
@@ -196,15 +316,11 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
 
     # Update config mit DB Password
     if [ -f "config/config.yaml" ]; then
-        # Setze DB Password in config
         sed -i 's/password: "changeme"/password: "pishield123"/' config/config.yaml 2>/dev/null || true
     fi
-
-    # Setze Umgebungsvariable
-    export PISHIELD_DB_PASSWORD="pishield123"
 else
-    log_warn "Docker nicht verfügbar - PostgreSQL muss manuell installiert werden"
-    log_info "Alternative: Installiere PostgreSQL mit: apt install postgresql"
+    log_warn "Docker nicht verfügbar - nutze lokalen SQLite Modus"
+    log_info "InjectionRadar funktioniert auch ohne Docker (eingeschränkt)"
 fi
 
 # ============================================================================
@@ -216,12 +332,18 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
     # Warte kurz auf DB
     sleep 2
 
-    # Führe init-db.sql aus
-    if [ -f "docker/init-db.sql" ]; then
-        if docker exec -i injectionradar-db psql -U pishield -d pishield < docker/init-db.sql &> /dev/null; then
-            log_success "Datenbank-Schema initialisiert"
-        else
-            log_warn "Schema bereits vorhanden oder Fehler bei Initialisierung"
+    # Schema wird automatisch durch docker-entrypoint-initdb.d geladen
+    # Prüfe ob Tabellen existieren
+    if $DOCKER_CMD exec pishield-db psql -U pishield -d pishield -c "SELECT 1 FROM domains LIMIT 1" &> /dev/null; then
+        log_success "Datenbank-Schema bereits vorhanden"
+    else
+        # Falls init-db.sql nicht automatisch geladen wurde
+        if [ -f "docker/init-db.sql" ]; then
+            if cat docker/init-db.sql | $DOCKER_CMD exec -i pishield-db psql -U pishield -d pishield &> /dev/null; then
+                log_success "Datenbank-Schema initialisiert"
+            else
+                log_warn "Schema-Initialisierung fehlgeschlagen (evtl. bereits vorhanden)"
+            fi
         fi
     fi
 fi
@@ -319,4 +441,17 @@ fi
 echo ""
 log_success "InjectionRadar ist bereit!"
 echo ""
-echo -e "${YELLOW}Starte mit:  injection-radar${NC}"
+
+# Hinweis auf docker-Gruppe
+if [ "$DOCKER_AVAILABLE" = true ]; then
+    echo -e "${YELLOW}WICHTIG:${NC} Für Docker-Zugriff musst du dich einmal neu anmelden"
+    echo -e "         (oder 'newgrp docker' ausführen)"
+    echo ""
+    echo -e "${BLUE}Dann starte mit:${NC}"
+    echo -e "     ${YELLOW}injection-radar${NC}"
+    echo ""
+    echo -e "${DIM}Ohne Neuanmeldung kannst du auch so starten:${NC}"
+    echo -e "     ${YELLOW}sg docker -c 'injection-radar'${NC}"
+else
+    echo -e "${YELLOW}Starte mit:  injection-radar${NC}"
+fi
