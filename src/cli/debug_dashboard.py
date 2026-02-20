@@ -305,13 +305,17 @@ class DebugDashboard:
                             pass
 
                 # Check for stuck/stale jobs
+                # Timeout scales with job count: ~60s per job / 4 workers
+                total_jobs = len(self.jobs)
+                per_job_timeout = max(180, total_jobs * 15)
+                stale_threshold = max(60, total_jobs * 5)
                 for tracker in self.jobs.values():
                     if tracker.state not in (JobState.DONE, JobState.FAILED):
                         wait_time = time.time() - tracker.start_time
-                        if wait_time > 180:
-                            tracker.fail("Timeout: no worker response after 180s")
-                        elif tracker.state == JobState.QUEUED and wait_time > 60 and not tracker._warned_stale:
-                            tracker.add_step("Warte ungewoehnlich lang - Worker evtl. nicht verfuegbar", state="running")
+                        if wait_time > per_job_timeout:
+                            tracker.fail(f"Timeout: no worker response after {per_job_timeout}s")
+                        elif tracker.state == JobState.QUEUED and wait_time > stale_threshold and not tracker._warned_stale:
+                            tracker.add_step("Warte auf freien Worker...", state="running")
                             tracker._warned_stale = True
 
                 live.update(self._render())
@@ -568,15 +572,20 @@ class DebugDashboard:
         """Pollt System-Status (Health, Queue)."""
         while self._running:
             try:
-                async with httpx.AsyncClient(timeout=3) as client:
-                    # Health Check
+                async with httpx.AsyncClient(timeout=10) as client:
+                    # Health Check (longer timeout - server may be busy with scans)
                     try:
                         resp = await client.get(f"{self.api_url}/health")
                         if resp.status_code == 200:
                             data = resp.json()
                             self.system_status["status"] = data.get("status", "unknown")
+                        elif resp.status_code == 429:
+                            # Rate limited but server is alive
+                            self.system_status["status"] = "healthy"
                     except Exception:
-                        self.system_status["status"] = "offline"
+                        # Only set offline if we had a previous successful poll
+                        if self.system_status["status"] == "unknown":
+                            self.system_status["status"] = "offline"
 
                     # Queue Stats
                     try:

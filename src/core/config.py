@@ -182,8 +182,32 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Singleton für Settings."""
+    """Singleton für Settings.
+
+    When Docker services are running (detected by PISHIELD_DB_TYPE env var or
+    by checking if PostgreSQL is reachable at localhost:5432), use PostgreSQL.
+    This ensures CLI commands like 'results' and 'history' read from the same
+    database as the Docker orchestrator.
+    """
     config_path = Path("config/config.yaml")
     if config_path.exists():
         return Settings.from_yaml(config_path)
+
+    # Auto-detect Docker PostgreSQL when no explicit config exists
+    if os.environ.get("PISHIELD_DB_TYPE") == "postgresql":
+        return Settings()  # env vars will override defaults
+
+    # Check if Docker PostgreSQL is reachable (CLI running alongside Docker)
+    try:
+        import socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        result = sock.connect_ex(("localhost", 5432))
+        sock.close()
+        if result == 0:
+            # PostgreSQL is running - use it instead of SQLite
+            return Settings(database=DatabaseConfig(type="postgresql", password="pishield"))
+    except Exception:
+        pass
+
     return Settings()

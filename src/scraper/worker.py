@@ -612,6 +612,7 @@ async def worker_main():
                         job_id=job.job_id,
                         url=job.url,
                         status="failed",
+                        classification="error",
                         error_message=str(e),
                         completed_at=datetime.now(timezone.utc).isoformat(),
                     )

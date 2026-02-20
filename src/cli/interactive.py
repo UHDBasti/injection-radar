@@ -1577,7 +1577,7 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
             url = url[:35] + "..."
 
         if result.get("success"):
-            classification = result.get("classification", "unknown")
+            classification = result.get("classification") or "unknown"
             color = status_colors.get(classification, "white")
             severity = result.get("severity_score", 0) or 0
             flags_list = result.get("flags") or []
