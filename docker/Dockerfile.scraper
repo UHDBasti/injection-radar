@@ -53,5 +53,8 @@ USER scraper
 
 # Kein exposed Port - kommuniziert nur über DB/Redis
 
+# Unbuffered output für Docker logs
+ENV PYTHONUNBUFFERED=1
+
 # Start Scraper Worker
 CMD ["python", "-m", "src.scraper.worker"]

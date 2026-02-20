@@ -143,7 +143,14 @@ _DEFAULT_RATE_LIMIT = 60  # read-only endpoints
 
 
 def _get_rate_limit(path: str) -> int:
-    """Return the per-minute rate limit for a request path."""
+    """Return the per-minute rate limit for a request path.
+
+    Status polling endpoints (/scan/{id}/status) use the default
+    (higher) limit so that polling doesn't get throttled.
+    """
+    # Status polling should not be rate-limited as strictly as scan submission
+    if "/status" in path:
+        return _DEFAULT_RATE_LIMIT
     for prefix, limit in _RATE_LIMITS.items():
         if path.rstrip("/") == prefix or path.startswith(prefix + "/"):
             return limit
