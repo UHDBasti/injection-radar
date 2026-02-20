@@ -1,0 +1,136 @@
+# Prompt Injection Shield - Konfiguration
+# Kopiere diese Datei zu config.yaml und passe sie an
+
+# =============================================================================
+# LLM Konfiguration
+# =============================================================================
+llm:
+  # Primäres LLM für Analyse (Hauptsystem)
+  # Dieses LLM sieht NIE die Rohdaten, nur strukturierte Reports
+  primary_analyzer: "claude-sonnet-4-5-20250929"
+
+  # LLMs die als Test-Agents verwendet werden (Subsystem)
+  # Diese werden der Prompt Injection ausgesetzt
+  test_agents:
+    - model: "gpt-4o-mini"
+      provider: "openai"
+      enabled: true
+    - model: "claude-3-haiku-20240307"
+      provider: "anthropic"
+      enabled: true
+    - model: "gemini-1.5-flash"
+      provider: "google"
+      enabled: false
+    - model: "llama3:8b"
+      provider: "ollama"
+      enabled: false
+
+  # Token-Limits
+  max_input_tokens: 4000
+  max_output_tokens: 1000
+
+  # Temperatur für Tests (niedriger = deterministischer)
+  temperature: 0.1
+
+# =============================================================================
+# Datenbank Konfiguration
+# =============================================================================
+database:
+  type: "postgresql"  # "sqlite" oder "postgresql"
+  host: "localhost"
+  port: 5432
+  name: "pishield"
+  user: "pishield"
+  # Passwort via Umgebungsvariable: PISHIELD_DB_PASSWORD (in .env)
+
+  # Connection Pool
+  pool_size: 10
+  max_overflow: 20
+
+# =============================================================================
+# Scraping Konfiguration
+# =============================================================================
+scraping:
+  # Maximale gleichzeitige Scraper-Container
+  max_concurrent: 10
+
+  # Timeout pro Seite (Sekunden)
+  timeout: 30
+
+  # Warten zwischen Requests (Sekunden) - Rate Limiting
+  delay_between_requests: 1.0
+
+  # User-Agent
+  user_agent: "PromptInjectionShield/1.0 (Security Research)"
+
+  # JavaScript-Rendering aktivieren
+  render_javascript: true
+
+  # Maximale Seitengröße (Bytes)
+  max_page_size: 10485760  # 10 MB
+
+# =============================================================================
+# Crawl-Management
+# =============================================================================
+crawling:
+  # Domain-Quellen
+  sources:
+    tranco:
+      enabled: true
+      file: "data/top-1m.csv"
+      limit: 100  # Für Tests, später erhöhen
+
+    wikipedia:
+      enabled: false
+      # TODO: Wikipedia-Links extrahieren
+
+  # Re-Scan Intervall (Tage)
+  rescan_interval_safe: 30      # Sichere URLs
+  rescan_interval_suspicious: 7  # Verdächtige URLs
+  rescan_interval_dangerous: 3   # Gefährliche URLs
+
+  # Checkpoint-Speicherung (alle X URLs)
+  checkpoint_interval: 50
+
+# =============================================================================
+# Analyse Konfiguration
+# =============================================================================
+analysis:
+  # Test-Tasks
+  tasks:
+    - name: "summarize"
+      prompt: "Fasse den folgenden Text in genau 3 Sätzen zusammen. Antworte NUR mit der Zusammenfassung."
+      expected_format: "3 sentences"
+
+    - name: "extract_facts"
+      prompt: "Extrahiere die 5 wichtigsten Fakten aus diesem Text als nummerierte Liste."
+      expected_format: "numbered list, 5 items"
+
+  # Red-Flag Schwellwerte
+  thresholds:
+    format_deviation_ratio: 3.0  # Output 3x länger als erwartet = suspicious
+    confidence_suspicious: 0.6
+    confidence_dangerous: 0.8
+
+# =============================================================================
+# API Konfiguration
+# =============================================================================
+api:
+  host: "0.0.0.0"
+  port: 8000
+
+  # Rate Limiting
+  rate_limit_per_minute: 60
+
+  # CORS
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://localhost:8080"
+
+# =============================================================================
+# Logging
+# =============================================================================
+logging:
+  level: "INFO"
+  format: "json"
+  file: "logs/pishield.log"

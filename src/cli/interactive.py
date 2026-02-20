@@ -326,6 +326,9 @@ def show_help():
 | `results domains` | Zeigt Domain-Risiko-Ranking |
 | `results <url>` | Zeigt Details fuer eine URL |
 | `history [n]` | Zeigt die letzten n Scans (Standard: 20) |
+| `db` | Zeigt Datenbank-Info und Tabellenübersicht |
+| `db urls [safe/dangerous/N]` | Zeigt gescannte URLs |
+| `db export` | Exportiert Daten für ML-Training (JSONL+CSV) |
 | `status` | Zeigt den aktuellen Status |
 | `services` | Zeigt Docker-Service-Status |
 | `restart` | Startet alle Services neu |
@@ -449,6 +452,338 @@ def show_logs(show_path: bool = False):
         except json.JSONDecodeError:
             # Falls kein JSON, zeige Zeile direkt
             console.print(f"[dim]{line.strip()}[/dim]")
+
+
+async def show_db_info(config: dict):
+    """Zeigt Datenbank-Verbindungsinfo und Übersicht."""
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        URLDB,
+        DomainDB,
+        ScanResultDB,
+        AnalysisResultDB,
+        ScrapedContentDB,
+        LLMRequestDB,
+        LLMResponseDB,
+    )
+    from sqlalchemy import select, func
+
+    settings = get_settings()
+
+    # Verbindungsinfo
+    db_type = settings.database.type
+    if db_type == "postgresql":
+        db_display = f"PostgreSQL @ {settings.database.host}:{settings.database.port}/{settings.database.name}"
+    else:
+        db_display = f"SQLite @ {settings.database.sqlite_path}"
+
+    console.print(f"\n[bold]Datenbank:[/bold] {db_display}")
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            urls = await session.scalar(select(func.count(URLDB.id))) or 0
+            domains = await session.scalar(select(func.count(DomainDB.id))) or 0
+            scraped = await session.scalar(select(func.count(ScrapedContentDB.id))) or 0
+            scan_results = await session.scalar(select(func.count(ScanResultDB.id))) or 0
+            analyses = await session.scalar(select(func.count(AnalysisResultDB.id))) or 0
+            llm_requests = await session.scalar(select(func.count(LLMRequestDB.id))) or 0
+            llm_responses = await session.scalar(select(func.count(LLMResponseDB.id))) or 0
+
+            # Klassifizierungsverteilung
+            status_counts = {}
+            for cls_val in ["safe", "suspicious", "dangerous", "error", "pending"]:
+                count = await session.scalar(
+                    select(func.count(URLDB.id)).where(URLDB.current_status == cls_val)
+                )
+                if count:
+                    status_counts[cls_val] = count
+
+        console.print(f"[green]Verbindung OK[/green]\n")
+
+        # Tabellen-Übersicht
+        table = Table(title="Datenbank-Übersicht", show_header=True, header_style="bold")
+        table.add_column("Tabelle", width=22)
+        table.add_column("Einträge", justify="right", width=10)
+        table.add_column("Beschreibung", max_width=35)
+
+        table.add_row("urls", f"{urls:,}", "Gescannte URLs")
+        table.add_row("domains", f"{domains:,}", "Erkannte Domains")
+        table.add_row("scraped_content", f"{scraped:,}", "Gescrapte Inhalte (HTML+Text)")
+        table.add_row("scan_results", f"{scan_results:,}", "Strukturierte Scan-Reports")
+        table.add_row("analysis_results", f"{analyses:,}", "Klassifizierungen")
+        table.add_row("llm_requests", f"{llm_requests:,}", "LLM-Anfragen")
+        table.add_row("llm_responses", f"{llm_responses:,}", "LLM-Antworten")
+        console.print(table)
+
+        # Klassifizierung
+        if status_counts:
+            console.print()
+            color_map = {"safe": "green", "suspicious": "yellow", "dangerous": "red", "error": "orange1", "pending": "dim"}
+            parts = []
+            for cls_val, count in status_counts.items():
+                color = color_map.get(cls_val, "white")
+                parts.append(f"[{color}]{cls_val}: {count}[/{color}]")
+            console.print("Klassifizierung: " + " | ".join(parts))
+
+        console.print(f"\n[dim]Befehle: db export | db export --format csv | db urls[/dim]")
+
+    except Exception as e:
+        log_error_with_trace("db_info_error", e)
+        console.print(f"[red]Verbindungsfehler: {e}[/red]")
+
+
+async def do_db_export(config: dict, export_format: str = "jsonl", output_dir: str = "data/exports"):
+    """Exportiert Scan-Daten für ML-Training.
+
+    Exportiert:
+    - training_data.jsonl: URL + gescrapeter Text + Klassifizierung + Flags
+    - urls.csv: Übersicht aller URLs mit Status
+    - analyses.jsonl: Detaillierte Analyse-Ergebnisse
+    """
+    import json as json_mod
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        URLDB,
+        DomainDB,
+        ScrapedContentDB,
+        ScanResultDB,
+        AnalysisResultDB,
+    )
+    from sqlalchemy import select, desc
+    from sqlalchemy.orm import selectinload
+
+    settings = get_settings()
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            # ============================================================
+            # 1. Training Data (JSONL) - URL + Text + Classification
+            # ============================================================
+            console.print("[bold]Exportiere Training-Daten...[/bold]")
+
+            result = await session.execute(
+                select(ScrapedContentDB)
+                .options(
+                    selectinload(ScrapedContentDB.url).selectinload(URLDB.domain),
+                    selectinload(ScrapedContentDB.url).selectinload(URLDB.analysis_results),
+                )
+                .order_by(desc(ScrapedContentDB.scraped_at))
+            )
+            scraped_items = result.scalars().all()
+
+            training_file = out_dir / "training_data.jsonl"
+            training_count = 0
+            with open(training_file, "w", encoding="utf-8") as f:
+                for item in scraped_items:
+                    url_obj = item.url
+                    if not url_obj:
+                        continue
+
+                    # Neueste Analyse finden
+                    latest_analysis = None
+                    if url_obj.analysis_results:
+                        latest_analysis = sorted(
+                            url_obj.analysis_results,
+                            key=lambda a: a.analyzed_at or datetime.min,
+                            reverse=True,
+                        )[0]
+
+                    record = {
+                        "url": url_obj.url,
+                        "domain": url_obj.domain.domain if url_obj.domain else None,
+                        "scraped_at": item.scraped_at.isoformat() if item.scraped_at else None,
+                        "http_status": item.http_status,
+                        "word_count": item.word_count,
+                        "text_length": item.text_length,
+                        "extracted_text": item.extracted_text[:50000],  # Limit für sehr große Seiten
+                        "content_hash": item.content_hash,
+                        "classification": (
+                            latest_analysis.classification.value
+                            if latest_analysis and latest_analysis.classification
+                            else url_obj.current_status.value if url_obj.current_status else "unknown"
+                        ),
+                        "severity_score": (
+                            latest_analysis.severity_score if latest_analysis else 0.0
+                        ),
+                        "confidence": (
+                            latest_analysis.confidence if latest_analysis else 0.0
+                        ),
+                        "flags": (
+                            latest_analysis.flags_triggered if latest_analysis else []
+                        ),
+                        "reasoning": (
+                            latest_analysis.reasoning if latest_analysis else None
+                        ),
+                    }
+                    f.write(json_mod.dumps(record, ensure_ascii=False) + "\n")
+                    training_count += 1
+
+            console.print(f"  [green]✓[/green] {training_count} Einträge → {training_file}")
+
+            # ============================================================
+            # 2. URLs Overview (CSV)
+            # ============================================================
+            result = await session.execute(
+                select(URLDB)
+                .options(selectinload(URLDB.domain))
+                .order_by(desc(URLDB.last_scanned))
+            )
+            all_urls = result.scalars().all()
+
+            urls_file = out_dir / "urls.csv"
+            with open(urls_file, "w", encoding="utf-8") as f:
+                f.write("url,domain,classification,confidence,scan_count,first_scanned,last_scanned\n")
+                for u in all_urls:
+                    domain = u.domain.domain if u.domain else ""
+                    status = u.current_status.value if u.current_status else "unknown"
+                    first = u.first_scanned.isoformat() if u.first_scanned else ""
+                    last = u.last_scanned.isoformat() if u.last_scanned else ""
+                    # CSV-escape für URLs mit Kommas
+                    url_escaped = f'"{u.url}"' if "," in u.url else u.url
+                    f.write(f"{url_escaped},{domain},{status},{u.current_confidence:.2f},{u.scan_count},{first},{last}\n")
+
+            console.print(f"  [green]✓[/green] {len(all_urls)} URLs → {urls_file}")
+
+            # ============================================================
+            # 3. Analyses Detail (JSONL)
+            # ============================================================
+            result = await session.execute(
+                select(AnalysisResultDB)
+                .options(
+                    selectinload(AnalysisResultDB.url),
+                    selectinload(AnalysisResultDB.scan_result),
+                )
+                .order_by(desc(AnalysisResultDB.analyzed_at))
+            )
+            analyses = result.scalars().all()
+
+            analyses_file = out_dir / "analyses.jsonl"
+            with open(analyses_file, "w", encoding="utf-8") as f:
+                for a in analyses:
+                    record = {
+                        "url": a.url.url if a.url else None,
+                        "classification": a.classification.value if a.classification else None,
+                        "severity_score": a.severity_score,
+                        "confidence": a.confidence,
+                        "flags_triggered": a.flags_triggered or [],
+                        "reasoning": a.reasoning,
+                        "analyzed_at": a.analyzed_at.isoformat() if a.analyzed_at else None,
+                        "llm_provider": a.scan_result.llm_provider if a.scan_result else None,
+                        "llm_model": a.scan_result.llm_model if a.scan_result else None,
+                        "tool_calls_attempted": a.scan_result.tool_calls_attempted if a.scan_result else False,
+                    }
+                    f.write(json_mod.dumps(record, ensure_ascii=False) + "\n")
+
+            console.print(f"  [green]✓[/green] {len(analyses)} Analysen → {analyses_file}")
+
+        # Summary
+        console.print(f"\n[bold green]Export abgeschlossen![/bold green]")
+        console.print(f"[dim]Verzeichnis: {out_dir.resolve()}[/dim]")
+        console.print(f"\n[bold]Dateien:[/bold]")
+        console.print(f"  training_data.jsonl  - Für ML-Training (URL + Text + Label)")
+        console.print(f"  urls.csv             - URL-Übersicht (CSV)")
+        console.print(f"  analyses.jsonl       - Detaillierte Analysen")
+
+        # Größen anzeigen
+        for f in [training_file, urls_file, analyses_file]:
+            if f.exists():
+                size = f.stat().st_size
+                if size > 1024 * 1024:
+                    console.print(f"  [dim]{f.name}: {size / 1024 / 1024:.1f} MB[/dim]")
+                else:
+                    console.print(f"  [dim]{f.name}: {size / 1024:.1f} KB[/dim]")
+
+    except Exception as e:
+        log_error_with_trace("db_export_error", e)
+        console.print(f"[red]Export-Fehler: {e}[/red]")
+
+
+async def show_db_urls(config: dict, limit: int = 50, status_filter: str = None):
+    """Zeigt alle gescannten URLs mit Details."""
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        URLDB,
+    )
+    from sqlalchemy import select, func, desc
+    from sqlalchemy.orm import selectinload
+
+    settings = get_settings()
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            query = (
+                select(URLDB)
+                .options(selectinload(URLDB.domain))
+                .order_by(desc(URLDB.last_scanned))
+                .limit(limit)
+            )
+
+            if status_filter:
+                query = query.where(URLDB.current_status == status_filter)
+
+            result = await session.execute(query)
+            urls = result.scalars().all()
+
+            total = await session.scalar(select(func.count(URLDB.id)))
+
+            if not urls:
+                console.print("[dim]Keine URLs in der Datenbank.[/dim]")
+                return
+
+            table = Table(show_header=True, header_style="bold", title=f"URLs ({len(urls)} von {total})")
+            table.add_column("#", style="dim", width=4)
+            table.add_column("URL", max_width=45)
+            table.add_column("Domain", max_width=20)
+            table.add_column("Status", width=12)
+            table.add_column("Conf.", justify="right", width=6)
+            table.add_column("Scans", justify="right", width=6)
+            table.add_column("Letzter Scan", width=16)
+
+            color_map = {"safe": "green", "suspicious": "yellow", "dangerous": "red", "error": "orange1", "pending": "dim"}
+
+            for i, u in enumerate(urls, 1):
+                status = u.current_status.value if u.current_status else "pending"
+                color = color_map.get(status, "white")
+                domain = u.domain.domain if u.domain else "-"
+                last = u.last_scanned.strftime("%Y-%m-%d %H:%M") if u.last_scanned else "-"
+
+                display_url = u.url
+                if len(display_url) > 43:
+                    display_url = display_url[:40] + "..."
+
+                table.add_row(
+                    str(i),
+                    display_url,
+                    domain[:18] + ".." if len(domain) > 20 else domain,
+                    f"[{color}]{status}[/{color}]",
+                    f"{u.current_confidence:.0%}",
+                    str(u.scan_count),
+                    last,
+                )
+
+            console.print(table)
+            console.print(f"\n[dim]Filter: db urls safe | db urls dangerous | db urls 100[/dim]")
+
+    except Exception as e:
+        log_error_with_trace("db_urls_error", e)
+        console.print(f"[red]Fehler: {e}[/red]")
 
 
 async def show_history(config: dict, limit: int = 20):
@@ -1894,6 +2229,30 @@ def interactive_shell():
                         # URL-Details
                         url_query = args[0]
                         loop.run_until_complete(show_results_url(url_query, config))
+
+                elif command == "db":
+                    if not args or args[0] in ("stats", "info"):
+                        loop.run_until_complete(show_db_info(config))
+                    elif args[0] == "export":
+                        export_format = "jsonl"
+                        output_dir = "data/exports"
+                        for i, a in enumerate(args[1:]):
+                            if a == "--format" and i + 1 < len(args[1:]):
+                                export_format = args[i + 2]
+                            elif a == "--dir" and i + 1 < len(args[1:]):
+                                output_dir = args[i + 2]
+                        loop.run_until_complete(do_db_export(config, export_format, output_dir))
+                    elif args[0] == "urls":
+                        limit = 50
+                        status_filter = None
+                        for a in args[1:]:
+                            if a.isdigit():
+                                limit = int(a)
+                            elif a in ("safe", "suspicious", "dangerous", "error", "pending"):
+                                status_filter = a
+                        loop.run_until_complete(show_db_urls(config, limit, status_filter))
+                    else:
+                        console.print("[dim]Befehle: db | db export | db urls [safe|dangerous|N][/dim]")
 
                 elif command == "services":
                     show_services_status()

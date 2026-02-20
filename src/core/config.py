@@ -180,34 +180,61 @@ class Settings(BaseSettings):
         return cls(**config_dict)
 
 
-@lru_cache
-def get_settings() -> Settings:
-    """Singleton für Settings.
+def _load_env_file():
+    """Lädt .env Datei in os.environ.
 
-    When Docker services are running (detected by PISHIELD_DB_TYPE env var or
-    by checking if PostgreSQL is reachable at localhost:5432), use PostgreSQL.
-    This ensures CLI commands like 'results' and 'history' read from the same
-    database as the Docker orchestrator.
+    Nötig weil pydantic-settings .env nur intern liest, aber nested models
+    (DatabaseConfig, RedisConfig) os.environ direkt prüfen.
     """
-    config_path = Path("config/config.yaml")
-    if config_path.exists():
-        return Settings.from_yaml(config_path)
+    env_path = Path(".env")
+    if not env_path.exists():
+        return
 
-    # Auto-detect Docker PostgreSQL when no explicit config exists
-    if os.environ.get("PISHIELD_DB_TYPE") == "postgresql":
-        return Settings()  # env vars will override defaults
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            # Nicht überschreiben wenn bereits gesetzt (echte Env-Vars haben Vorrang)
+            if key and key not in os.environ:
+                os.environ[key] = value
 
-    # Check if Docker PostgreSQL is reachable (CLI running alongside Docker)
+
+def _detect_docker_postgresql() -> bool:
+    """Prüft ob Docker PostgreSQL auf localhost:5432 erreichbar ist."""
     try:
         import socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.5)
         result = sock.connect_ex(("localhost", 5432))
         sock.close()
-        if result == 0:
-            # PostgreSQL is running - use it instead of SQLite
-            return Settings(database=DatabaseConfig(type="postgresql", password="pishield"))
+        return result == 0
     except Exception:
-        pass
+        return False
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Singleton für Settings.
+
+    1. Lädt .env in os.environ (damit nested models die Vars finden)
+    2. Auto-detect Docker PostgreSQL und setzt PISHIELD_DB_TYPE
+    3. Lädt config.yaml oder erstellt Default-Settings
+    4. DatabaseConfig.__init__ liest dann automatisch die Env-Vars
+    """
+    # Schritt 1: .env in os.environ laden
+    _load_env_file()
+
+    # Schritt 2: PostgreSQL auto-detect wenn kein expliziter DB-Typ gesetzt
+    if "PISHIELD_DB_TYPE" not in os.environ and _detect_docker_postgresql():
+        os.environ["PISHIELD_DB_TYPE"] = "postgresql"
+
+    # Schritt 3: Settings laden (DatabaseConfig.__init__ liest jetzt os.environ)
+    config_path = Path("config/config.yaml")
+    if config_path.exists():
+        return Settings.from_yaml(config_path)
 
     return Settings()
