@@ -313,12 +313,17 @@ def show_help():
 |--------|--------------|
 | `scan <url>` | Scannt eine URL |
 | `scan <url1> <url2> ...` | Scannt mehrere URLs parallel (max 10) |
-| `scan list <file.csv>` | Scannt URLs aus einer CSV-Datei |
+| `scan list <file.csv>` | Scannt URLs aus CSV (Standard: max 100) |
+| `scan list <file> --limit 500` | CSV-Scan mit benutzerdefiniertem Limit |
+| `scan list <file> --all` | Alle URLs aus CSV scannen |
 | `scan <url> --local` | Lokaler Scan ohne Docker |
 | `scan <url> --quick` | Schneller Scan ohne LLM |
 | `scan <url> --debug` | Scan mit Live Debug Dashboard |
 | `resume` | Zeigt offene Checkpoints und setzt Batch-Scan fort |
 | `debug on` / `debug off` | Debug-Modus ein/ausschalten |
+| `results` | Zeigt Scan-Ergebnisse und Statistiken |
+| `results domains` | Zeigt Domain-Risiko-Ranking |
+| `results <url>` | Zeigt Details fuer eine URL |
 | `history [n]` | Zeigt die letzten n Scans (Standard: 20) |
 | `status` | Zeigt den aktuellen Status |
 | `services` | Zeigt Docker-Service-Status |
@@ -345,9 +350,12 @@ Falls Docker nicht verfügbar ist, wird automatisch der lokale Modus verwendet.
 > scan https://example.com            # Automatisch via Docker
 > scan https://example.com --debug    # Mit Live Debug Dashboard
 > scan https://example.com --local    # Erzwinge lokalen Modus
+> scan list top-1m.csv                # CSV-Scan (max 100 URLs)
+> scan list top-1m.csv --limit 500    # CSV-Scan mit Limit
+> scan list top-1m.csv --all          # Alle URLs scannen
+> results                             # Scan-Ergebnisse anzeigen
+> results domains                     # Domain-Ranking anzeigen
 > debug on                            # Debug-Modus dauerhaft an
-> scan example.com google.com         # Paralleler Debug-Scan
-> debug off                           # Debug-Modus aus
 > services                            # Zeige Container-Status
 ```
 
@@ -544,6 +552,436 @@ async def show_history(config: dict, limit: int = 20):
         log_error_with_trace("history_error", e)
         console.print(f"[red]Fehler beim Laden der History: {e}[/red]")
         console.print("[dim]Ist die Datenbank erreichbar?[/dim]")
+
+
+async def show_results_overview(config: dict):
+    """Zeigt eine Uebersicht der Scan-Ergebnisse und Statistiken."""
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        URLDB,
+        DomainDB,
+        ScanResultDB,
+        AnalysisResultDB,
+        ScrapedContentDB,
+    )
+    from sqlalchemy import select, func, desc
+    from sqlalchemy.orm import selectinload
+
+    settings = get_settings()
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            # Gesamtstatistiken
+            total_urls = await session.scalar(select(func.count(URLDB.id)))
+            total_domains = await session.scalar(select(func.count(DomainDB.id)))
+            total_scans = await session.scalar(select(func.count(ScrapedContentDB.id)))
+            total_analyses = await session.scalar(select(func.count(AnalysisResultDB.id)))
+
+            # Klassifizierungsverteilung
+            status_counts = {}
+            for cls_val in ["safe", "suspicious", "dangerous", "error", "pending"]:
+                count = await session.scalar(
+                    select(func.count(URLDB.id)).where(
+                        URLDB.current_status == cls_val
+                    )
+                )
+                status_counts[cls_val] = count or 0
+
+            # Top gefaehrliche Domains
+            dangerous_domains = (await session.execute(
+                select(DomainDB)
+                .where(DomainDB.dangerous_urls_count > 0)
+                .order_by(desc(DomainDB.risk_score))
+                .limit(10)
+            )).scalars().all()
+
+            # Letzte Analyse-Ergebnisse
+            recent_analyses = (await session.execute(
+                select(AnalysisResultDB)
+                .options(
+                    selectinload(AnalysisResultDB.url),
+                )
+                .order_by(desc(AnalysisResultDB.analyzed_at))
+                .limit(20)
+            )).scalars().all()
+
+        # === Ausgabe ===
+
+        # Zusammenfassung
+        console.print()
+        summary_table = Table(show_header=False, box=None, padding=(0, 2))
+        summary_table.add_column("Metric", style="bold")
+        summary_table.add_column("Value", justify="right")
+        summary_table.add_row("URLs gescannt", f"{total_urls:,}")
+        summary_table.add_row("Domains", f"{total_domains:,}")
+        summary_table.add_row("Scans gesamt", f"{total_scans:,}")
+        summary_table.add_row("Analysen", f"{total_analyses:,}")
+
+        console.print(Panel(
+            summary_table,
+            title="[bold cyan]Scan-Statistiken[/bold cyan]",
+            border_style="cyan",
+        ))
+
+        # Klassifizierungsverteilung
+        console.print()
+        cls_table = Table(show_header=True, header_style="bold")
+        cls_table.add_column("Klassifizierung", width=15)
+        cls_table.add_column("Anzahl", justify="right", width=8)
+        cls_table.add_column("Anteil", justify="right", width=8)
+        cls_table.add_column("", width=30)
+
+        color_map = {
+            "safe": "green",
+            "suspicious": "yellow",
+            "dangerous": "red",
+            "error": "orange1",
+            "pending": "dim",
+        }
+
+        for cls_val, count in status_counts.items():
+            if count == 0 and cls_val == "pending":
+                continue
+            color = color_map.get(cls_val, "white")
+            pct = (count / total_urls * 100) if total_urls > 0 else 0
+            bar_len = int(pct / 100 * 25)
+            bar = "█" * bar_len + "░" * (25 - bar_len)
+            cls_table.add_row(
+                f"[{color}]{cls_val}[/{color}]",
+                str(count),
+                f"{pct:.1f}%",
+                f"[{color}]{bar}[/{color}]",
+            )
+
+        console.print(Panel(cls_table, title="[bold]Verteilung[/bold]"))
+
+        # Gefaehrliche Domains
+        if dangerous_domains:
+            console.print()
+            dom_table = Table(show_header=True, header_style="bold")
+            dom_table.add_column("Domain", max_width=30)
+            dom_table.add_column("Risiko", justify="right", width=8)
+            dom_table.add_column("Gefaehrlich", justify="right", width=12)
+            dom_table.add_column("Verdaechtig", justify="right", width=12)
+            dom_table.add_column("Gesamt", justify="right", width=8)
+
+            for d in dangerous_domains:
+                risk_color = "red" if d.risk_score >= 7 else "yellow" if d.risk_score >= 4 else "green"
+                dom_table.add_row(
+                    d.domain,
+                    f"[{risk_color}]{d.risk_score:.1f}[/{risk_color}]",
+                    f"[red]{d.dangerous_urls_count}[/red]" if d.dangerous_urls_count else "0",
+                    f"[yellow]{d.suspicious_urls_count}[/yellow]" if d.suspicious_urls_count else "0",
+                    str(d.total_urls_scanned),
+                )
+
+            console.print(Panel(dom_table, title="[bold red]Gefaehrliche Domains (Top 10)[/bold red]"))
+
+        # Letzte Analysen
+        if recent_analyses:
+            console.print()
+            res_table = Table(show_header=True, header_style="bold")
+            res_table.add_column("URL", max_width=40)
+            res_table.add_column("Status", width=12)
+            res_table.add_column("Severity", justify="right", width=8)
+            res_table.add_column("Flags", justify="right", width=6)
+            res_table.add_column("Analysiert", width=16)
+
+            for a in recent_analyses:
+                url_display = a.url.url if a.url else "?"
+                if len(url_display) > 38:
+                    url_display = url_display[:35] + "..."
+
+                cls = a.classification.value if a.classification else "unknown"
+                color = color_map.get(cls, "white")
+                flags_list = a.flags_triggered or []
+                ts = a.analyzed_at.strftime("%Y-%m-%d %H:%M") if a.analyzed_at else "-"
+
+                res_table.add_row(
+                    url_display,
+                    f"[{color}]{cls}[/{color}]",
+                    f"{a.severity_score:.1f}",
+                    str(len(flags_list)),
+                    ts,
+                )
+
+            console.print(Panel(res_table, title="[bold]Letzte Analysen[/bold]"))
+        else:
+            console.print("\n[dim]Noch keine Analyse-Ergebnisse vorhanden.[/dim]")
+
+        console.print(
+            "\n[dim]Details: results domains | results <url>[/dim]"
+        )
+
+    except Exception as e:
+        log_error_with_trace("results_overview_error", e)
+        console.print(f"[red]Fehler: {e}[/red]")
+        console.print("[dim]Ist die Datenbank erreichbar?[/dim]")
+
+
+async def show_results_domains(config: dict, limit: int = 30):
+    """Zeigt Domain-Risiko-Ranking."""
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        DomainDB,
+    )
+    from sqlalchemy import select, desc
+    from sqlalchemy.orm import selectinload
+
+    settings = get_settings()
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            domains = (await session.execute(
+                select(DomainDB)
+                .where(DomainDB.total_urls_scanned > 0)
+                .order_by(desc(DomainDB.risk_score))
+                .limit(limit)
+            )).scalars().all()
+
+        if not domains:
+            console.print("[dim]Noch keine Domain-Daten vorhanden.[/dim]")
+            return
+
+        console.print()
+        table = Table(show_header=True, header_style="bold", title="Domain-Ranking")
+        table.add_column("#", style="dim", width=4)
+        table.add_column("Domain", max_width=35)
+        table.add_column("Risiko", justify="right", width=8)
+        table.add_column("Gefaehrlich", justify="right", width=12)
+        table.add_column("Verdaechtig", justify="right", width=12)
+        table.add_column("Gesamt", justify="right", width=8)
+        table.add_column("Seit", width=12)
+
+        for i, d in enumerate(domains, 1):
+            risk_color = "red" if d.risk_score >= 7 else "yellow" if d.risk_score >= 4 else "green"
+            since = d.first_seen.strftime("%Y-%m-%d") if d.first_seen else "-"
+
+            table.add_row(
+                str(i),
+                d.domain,
+                f"[{risk_color}]{d.risk_score:.1f}[/{risk_color}]",
+                f"[red]{d.dangerous_urls_count}[/red]" if d.dangerous_urls_count else "0",
+                f"[yellow]{d.suspicious_urls_count}[/yellow]" if d.suspicious_urls_count else "0",
+                str(d.total_urls_scanned),
+                since,
+            )
+
+        console.print(table)
+        console.print(f"\n[dim]Zeige Top {min(limit, len(domains))} von {len(domains)} Domains[/dim]")
+
+    except Exception as e:
+        log_error_with_trace("results_domains_error", e)
+        console.print(f"[red]Fehler: {e}[/red]")
+
+
+async def show_results_url(url_query: str, config: dict):
+    """Zeigt detaillierte Ergebnisse fuer eine bestimmte URL."""
+    from ..core.config import get_settings
+    from ..core.database import (
+        get_async_engine,
+        get_async_session_factory,
+        URLDB,
+        DomainDB,
+        ScrapedContentDB,
+        ScanResultDB,
+        AnalysisResultDB,
+    )
+    from sqlalchemy import select, desc
+    from sqlalchemy.orm import selectinload
+
+    settings = get_settings()
+
+    # URL normalisieren
+    if not url_query.startswith(("http://", "https://")):
+        url_query = "https://" + url_query
+
+    try:
+        engine = get_async_engine(settings.database.url)
+        SessionFactory = get_async_session_factory(engine)
+
+        async with SessionFactory() as session:
+            # URL suchen (exakt oder LIKE)
+            url_obj = (await session.execute(
+                select(URLDB)
+                .options(selectinload(URLDB.domain))
+                .where(URLDB.url == url_query)
+            )).scalar_one_or_none()
+
+            if not url_obj:
+                # Fuzzy-Suche
+                url_objs = (await session.execute(
+                    select(URLDB)
+                    .options(selectinload(URLDB.domain))
+                    .where(URLDB.url.contains(url_query.replace("https://", "").replace("http://", "")))
+                    .limit(5)
+                )).scalars().all()
+
+                if not url_objs:
+                    console.print(f"[yellow]URL nicht gefunden: {url_query}[/yellow]")
+                    console.print("[dim]Tipp: Gib die vollstaendige URL ein[/dim]")
+                    return
+
+                if len(url_objs) == 1:
+                    url_obj = url_objs[0]
+                else:
+                    console.print(f"\n[yellow]Mehrere Treffer fuer '{url_query}':[/yellow]")
+                    for i, u in enumerate(url_objs, 1):
+                        console.print(f"  [{i}] {u.url}")
+                    console.print("[dim]Bitte gib die vollstaendige URL ein[/dim]")
+                    return
+
+            # Details laden
+            scraped = (await session.execute(
+                select(ScrapedContentDB)
+                .where(ScrapedContentDB.url_id == url_obj.id)
+                .order_by(desc(ScrapedContentDB.scraped_at))
+                .limit(5)
+            )).scalars().all()
+
+            scan_results = (await session.execute(
+                select(ScanResultDB)
+                .where(ScanResultDB.url_id == url_obj.id)
+                .order_by(desc(ScanResultDB.scanned_at))
+                .limit(5)
+            )).scalars().all()
+
+            analyses = (await session.execute(
+                select(AnalysisResultDB)
+                .where(AnalysisResultDB.url_id == url_obj.id)
+                .order_by(desc(AnalysisResultDB.analyzed_at))
+                .limit(5)
+            )).scalars().all()
+
+        # === Ausgabe ===
+        console.print()
+
+        # URL-Info
+        domain_name = url_obj.domain.domain if url_obj.domain else "-"
+        status = url_obj.current_status.value if url_obj.current_status else "pending"
+        color_map = {
+            "safe": "green", "suspicious": "yellow", "dangerous": "red",
+            "error": "orange1", "pending": "dim",
+        }
+        color = color_map.get(status, "white")
+
+        info_table = Table(show_header=False, box=None, padding=(0, 2))
+        info_table.add_column("Key", style="bold", width=18)
+        info_table.add_column("Value")
+        info_table.add_row("URL", url_obj.url)
+        info_table.add_row("Domain", domain_name)
+        info_table.add_row("Status", f"[{color}]{status}[/{color}]")
+        info_table.add_row("Konfidenz", f"{url_obj.current_confidence:.1%}")
+        info_table.add_row("Scan-Anzahl", str(url_obj.scan_count))
+        if url_obj.first_scanned:
+            info_table.add_row("Erster Scan", url_obj.first_scanned.strftime("%Y-%m-%d %H:%M"))
+        if url_obj.last_scanned:
+            info_table.add_row("Letzter Scan", url_obj.last_scanned.strftime("%Y-%m-%d %H:%M"))
+
+        console.print(Panel(info_table, title="[bold cyan]URL-Details[/bold cyan]", border_style="cyan"))
+
+        # Scrape-Daten
+        if scraped:
+            console.print()
+            sc_table = Table(show_header=True, header_style="bold")
+            sc_table.add_column("Datum", width=16)
+            sc_table.add_column("HTTP", width=5)
+            sc_table.add_column("Woerter", justify="right", width=10)
+            sc_table.add_column("Zeichen", justify="right", width=10)
+            sc_table.add_column("Response", justify="right", width=10)
+
+            for s in scraped:
+                http_color = "green" if s.http_status < 300 else "yellow" if s.http_status < 400 else "red"
+                sc_table.add_row(
+                    s.scraped_at.strftime("%Y-%m-%d %H:%M"),
+                    f"[{http_color}]{s.http_status}[/{http_color}]",
+                    f"{s.word_count:,}",
+                    f"{s.text_length:,}",
+                    f"{s.response_time_ms}ms",
+                )
+
+            console.print(Panel(sc_table, title="[bold]Scrape-Daten[/bold]"))
+
+        # Analyse-Ergebnisse
+        if analyses:
+            console.print()
+            for a in analyses:
+                cls = a.classification.value if a.classification else "unknown"
+                a_color = color_map.get(cls, "white")
+                ts = a.analyzed_at.strftime("%Y-%m-%d %H:%M") if a.analyzed_at else "-"
+
+                a_table = Table(show_header=False, box=None, padding=(0, 2))
+                a_table.add_column("Key", style="bold", width=18)
+                a_table.add_column("Value")
+                a_table.add_row("Klassifizierung", f"[{a_color}]{cls}[/{a_color}]")
+                a_table.add_row("Severity Score", f"{a.severity_score:.1f}/10")
+                a_table.add_row("Konfidenz", f"{a.confidence:.1%}")
+                a_table.add_row("Analysiert", ts)
+
+                if a.reasoning:
+                    a_table.add_row("Begruendung", a.reasoning[:200])
+
+                console.print(Panel(a_table, title=f"[bold]Analyse vom {ts}[/bold]"))
+
+                # Flags
+                flags = a.flags_triggered or []
+                if flags:
+                    f_table = Table(show_header=True, header_style="bold")
+                    f_table.add_column("Typ", width=25)
+                    f_table.add_column("Schweregrad", width=12)
+                    f_table.add_column("Beschreibung", max_width=40)
+
+                    sev_colors = {"critical": "red", "high": "orange1", "medium": "yellow", "low": "blue"}
+
+                    for flag in flags:
+                        sev = flag.get("severity", "low")
+                        f_color = sev_colors.get(sev, "white")
+                        f_table.add_row(
+                            flag.get("type", "?"),
+                            f"[{f_color}]{sev}[/{f_color}]",
+                            flag.get("description", "")[:40],
+                        )
+
+                    console.print(f_table)
+        else:
+            console.print("\n[dim]Keine Analyse-Ergebnisse fuer diese URL.[/dim]")
+
+        # Scan-Results
+        if scan_results:
+            console.print()
+            sr_table = Table(show_header=True, header_style="bold")
+            sr_table.add_column("Datum", width=16)
+            sr_table.add_column("LLM", width=25)
+            sr_table.add_column("Tool-Calls", width=10)
+            sr_table.add_column("Flags", justify="right", width=6)
+
+            for sr in scan_results:
+                tc = "[red]Ja![/red]" if sr.tool_calls_attempted else "[green]Nein[/green]"
+                flags_list = sr.flags_detected or []
+                sr_table.add_row(
+                    sr.scanned_at.strftime("%Y-%m-%d %H:%M"),
+                    f"{sr.llm_provider}/{sr.llm_model}",
+                    tc,
+                    str(len(flags_list)),
+                )
+
+            console.print(Panel(sr_table, title="[bold]Scan-Results (Subsystem)[/bold]"))
+
+        console.print()
+
+    except Exception as e:
+        log_error_with_trace("results_url_error", e)
+        console.print(f"[red]Fehler: {e}[/red]")
 
 
 async def do_scan_via_api(url: str, config: dict):
@@ -967,7 +1405,7 @@ def load_urls_from_csv(file_path: str) -> list[str]:
 async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 10,
                            checkpoint_file: Optional[str] = None,
                            all_urls: Optional[list[str]] = None):
-    """Scannt mehrere URLs parallel.
+    """Scannt mehrere URLs parallel mit sauberer Abbruch-Unterstützung.
 
     Args:
         urls: Liste der zu scannenden URLs (may be filtered for resume)
@@ -983,12 +1421,9 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
         console.print("[yellow]Keine URLs zum Scannen.[/yellow]")
         return
 
-    # Begrenze auf max_concurrent
-    if len(urls) > max_concurrent:
-        console.print(f"[yellow]Hinweis: Limitiere auf {max_concurrent} parallele Scans[/yellow]")
-
     api_url = config.get("orchestrator_url", "http://localhost:8000")
     results = []
+    cancelled = False
     semaphore = asyncio.Semaphore(max_concurrent)
 
     # Checkpoint state: start from existing progress if resuming
@@ -1017,6 +1452,8 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
                         result["success"] = True
                     else:
                         result = {"url": url, "success": False, "error": response.text}
+            except asyncio.CancelledError:
+                return {"url": url, "success": False, "error": "cancelled"}
             except Exception as e:
                 result = {"url": url, "success": False, "error": str(e)}
 
@@ -1042,21 +1479,65 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
         return
 
     console.print(f"\n[bold]Starte parallelen Scan von {len(urls)} URLs[/bold]")
-    console.print(f"[dim]Max. parallel: {max_concurrent}[/dim]\n")
+    console.print(f"[dim]Max. parallel: {max_concurrent} | Ctrl+C zum Abbrechen[/dim]\n")
 
-    with Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TextColumn("({task.completed}/{task.total})"),
-        TimeRemainingColumn(),
-        console=console,
-    ) as progress:
-        task_id = progress.add_task("Scanne URLs...", total=len(urls))
+    try:
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("({task.completed}/{task.total})"),
+            TimeRemainingColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task("Scanne URLs...", total=len(urls))
 
-        # Alle Scans parallel starten
-        tasks = [scan_one(url, progress, task_id) for url in urls]
-        results = await asyncio.gather(*tasks)
+            # Alle Scans als Tasks starten
+            tasks = [asyncio.create_task(scan_one(url, progress, task_id)) for url in urls]
+
+            try:
+                results = await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                cancelled = True
+                # Alle laufenden Tasks canceln
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                # Ergebnisse der fertigen Tasks sammeln
+                results = []
+                for t in tasks:
+                    if t.done() and not t.cancelled():
+                        try:
+                            results.append(t.result())
+                        except Exception:
+                            pass
+    except KeyboardInterrupt:
+        cancelled = True
+        # Sofort alle Tasks canceln
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        # Fertige Ergebnisse sammeln
+        results = []
+        for t in tasks:
+            if t.done() and not t.cancelled():
+                try:
+                    results.append(t.result())
+                except Exception:
+                    pass
+
+    if cancelled:
+        # Checkpoint bei Abbruch speichern
+        if checkpoint_file:
+            save_checkpoint(checkpoint_file, full_url_list,
+                            completed_urls, failed_urls)
+            remaining = len(full_url_list) - len(completed_urls) - len(failed_urls)
+            console.print(f"\n[yellow]Scan abgebrochen.[/yellow]")
+            console.print(f"[dim]Checkpoint gespeichert: {len(completed_urls)} fertig, {remaining} verbleiben[/dim]")
+            console.print(f"[dim]Fortsetzen mit: resume[/dim]")
+        else:
+            console.print(f"\n[yellow]Scan abgebrochen.[/yellow]")
+        return results
 
     # Ergebnisse zusammenfassen
     success_count = sum(1 for r in results if r.get("success"))
@@ -1170,7 +1651,8 @@ def interactive_shell():
                     f"Queue: {queue_len} Jobs | "
                     f"2 Scraper-Worker aktiv[/dim]\n\n"
                     f"Starte Scans mit [bold cyan]scan <url>[/bold cyan] oder [bold cyan]scan list <datei.csv>[/bold cyan]\n"
-                    f"Debug-Modus: [bold cyan]scan <url> --debug[/bold cyan]",
+                    f"Ergebnisse: [bold cyan]results[/bold cyan] | "
+                    f"Debug: [bold cyan]scan <url> --debug[/bold cyan]",
                     title="[bold cyan]InjectionRadar[/bold cyan]",
                     border_style="green",
                     padding=(1, 2),
@@ -1240,18 +1722,32 @@ def interactive_shell():
                     if args[0] == "list":
                         if len(args) < 2:
                             console.print("[red]Bitte gib eine CSV-Datei an: scan list <file.csv>[/red]")
+                            console.print("[dim]Optionen: --limit N (Standard: 100), --all (kein Limit)[/dim]")
                             continue
 
                         file_path = args[1]
+
+                        # Parse --limit N und --all
+                        scan_limit = 100  # Default-Limit
+                        remaining_args = args[2:]
+                        for i, a in enumerate(remaining_args):
+                            if a == "--limit" and i + 1 < len(remaining_args):
+                                try:
+                                    scan_limit = int(remaining_args[i + 1])
+                                except ValueError:
+                                    console.print("[red]--limit braucht eine Zahl[/red]")
+                                    continue
+                            elif a == "--all":
+                                scan_limit = 0  # 0 = kein Limit
+
                         try:
                             urls = load_urls_from_csv(file_path)
-                            console.print(f"[green]v[/green] {len(urls)} URLs aus {file_path} geladen")
+                            total_in_file = len(urls)
+                            console.print(f"[green]v[/green] {total_in_file} URLs aus {file_path} geladen")
 
                             if not urls:
                                 console.print("[yellow]Keine URLs in der Datei gefunden.[/yellow]")
                                 continue
-
-                            all_urls = list(urls)
 
                             # Check for existing checkpoint
                             cp = load_checkpoint(file_path)
@@ -1284,6 +1780,19 @@ def interactive_shell():
                                 delete_checkpoint(file_path)
                                 continue
 
+                            # Limit anwenden (0 = kein Limit)
+                            all_urls = list(urls)
+                            if scan_limit > 0 and len(urls) > scan_limit:
+                                urls = urls[:scan_limit]
+                                console.print(
+                                    f"[yellow]Limitiere auf {scan_limit} URLs "
+                                    f"(von {len(all_urls)} verfuegbaren)[/yellow]"
+                                )
+                                console.print(
+                                    f"[dim]Aendern mit: scan list {file_path} --limit 500 "
+                                    f"oder --all[/dim]"
+                                )
+
                             if use_debug and not local:
                                 dashboard = DebugDashboard(config, console)
                                 loop.run_until_complete(dashboard.run(urls))
@@ -1297,6 +1806,10 @@ def interactive_shell():
                                 )
                         except FileNotFoundError as e:
                             console.print(f"[red]{e}[/red]")
+                        except KeyboardInterrupt:
+                            console.print("\n[yellow]Scan abgebrochen.[/yellow]")
+                            if checkpoint_file:
+                                console.print("[dim]Fortsetzen mit: resume[/dim]")
                         except Exception as e:
                             console.print(f"[red]Fehler beim Laden der CSV: {e}[/red]")
                         continue
@@ -1311,19 +1824,22 @@ def interactive_shell():
                             url = "https://" + url
                         normalized_urls.append(url)
 
-                    if use_debug and not local:
-                        # Debug Dashboard fuer alle Scans (auch Einzel-Scans)
-                        dashboard = DebugDashboard(config, console)
-                        loop.run_until_complete(dashboard.run(normalized_urls))
-                    elif len(normalized_urls) == 1:
-                        # Einzelner Scan
-                        loop.run_until_complete(do_scan(normalized_urls[0], config, quick, local))
-                    else:
-                        # Paralleler Scan
-                        if local:
-                            console.print("[yellow]Paralleler Scan nur via API möglich[/yellow]")
-                            continue
-                        loop.run_until_complete(do_scan_multiple(normalized_urls, config))
+                    try:
+                        if use_debug and not local:
+                            # Debug Dashboard fuer alle Scans (auch Einzel-Scans)
+                            dashboard = DebugDashboard(config, console)
+                            loop.run_until_complete(dashboard.run(normalized_urls))
+                        elif len(normalized_urls) == 1:
+                            # Einzelner Scan
+                            loop.run_until_complete(do_scan(normalized_urls[0], config, quick, local))
+                        else:
+                            # Paralleler Scan
+                            if local:
+                                console.print("[yellow]Paralleler Scan nur via API möglich[/yellow]")
+                                continue
+                            loop.run_until_complete(do_scan_multiple(normalized_urls, config))
+                    except KeyboardInterrupt:
+                        console.print("\n[yellow]Scan abgebrochen.[/yellow]")
 
                 elif command == "logs":
                     show_path = "-f" in args or "--file" in args
@@ -1334,6 +1850,20 @@ def interactive_shell():
                     if args and args[0].isdigit():
                         limit = int(args[0])
                     loop.run_until_complete(show_history(config, limit))
+
+                elif command == "results":
+                    if not args:
+                        # Uebersicht
+                        loop.run_until_complete(show_results_overview(config))
+                    elif args[0].lower() == "domains":
+                        limit = 30
+                        if len(args) > 1 and args[1].isdigit():
+                            limit = int(args[1])
+                        loop.run_until_complete(show_results_domains(config, limit))
+                    else:
+                        # URL-Details
+                        url_query = args[0]
+                        loop.run_until_complete(show_results_url(url_query, config))
 
                 elif command == "services":
                     show_services_status()
@@ -1436,11 +1966,13 @@ def interactive_shell():
             pending = asyncio.all_tasks(loop)
             for task in pending:
                 task.cancel()
-            # Loop schließen
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             loop.run_until_complete(loop.shutdown_asyncgens())
-            loop.close()
         except Exception:
             pass
+        finally:
+            loop.close()
 
 
 def main():
