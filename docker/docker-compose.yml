@@ -71,7 +71,7 @@ services:
       - ../.env
     # Wird über docker-compose scale gesteuert
     deploy:
-      replicas: 2  # Start mit 2, max 10
+      replicas: 4  # Scaled up for parallel scanning, max 10
       resources:
         limits:
           cpus: '0.5'

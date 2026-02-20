@@ -42,6 +42,7 @@ from ..llm.anthropic import (
     SUMMARIZE_USER_PROMPT_TEMPLATE,
 )
 from ..analysis.detector import RedFlagDetector
+from .stealth import get_random_user_agent, apply_stealth, is_bot_protection_page
 
 
 # Graceful shutdown flag
@@ -127,10 +128,13 @@ class ScraperWorker:
             raise RuntimeError("Worker not started. Call start() first.")
 
         start_time = datetime.now(timezone.utc)
+        ua = get_random_user_agent()
         context = await self.browser.new_context(
-            user_agent=self.settings.scraping.user_agent,
+            user_agent=ua,
+            viewport={"width": 1920, "height": 1080},
         )
         page = await context.new_page()
+        await apply_stealth(page)
 
         try:
             # Seite laden
@@ -189,23 +193,31 @@ class ScraperWorker:
 
     async def _extract_text(self, page: Page, html: str) -> str:
         """Extrahiert lesbaren Text aus der Seite."""
-        soup = BeautifulSoup(html, "lxml")
+        # Primaer: readability-lxml fuer bessere Content-Extraktion
+        try:
+            from readability import Document
+            doc = Document(html)
+            readable_html = doc.summary()
+            soup = BeautifulSoup(readable_html, "lxml")
+            text = soup.get_text(separator=" ", strip=True)
+            if len(text.split()) > 20:  # Nur nutzen wenn genug Content extrahiert wurde
+                text = re.sub(r"\s+", " ", text)
+                max_length = self.settings.scraping.max_page_size
+                if len(text) > max_length:
+                    text = text[:max_length]
+                return text
+        except Exception:
+            pass
 
-        # Entferne Script und Style Tags
+        # Fallback: BeautifulSoup (wie bisher)
+        soup = BeautifulSoup(html, "lxml")
         for tag in soup(["script", "style", "noscript", "header", "footer", "nav"]):
             tag.decompose()
-
-        # Text extrahieren
         text = soup.get_text(separator=" ", strip=True)
-
-        # Mehrfache Whitespaces entfernen
         text = re.sub(r"\s+", " ", text)
-
-        # Auf maximale Länge beschränken
         max_length = self.settings.scraping.max_page_size
         if len(text) > max_length:
             text = text[:max_length]
-
         return text
 
     async def _extract_meta_tags(self, page: Page) -> dict:
@@ -489,61 +501,87 @@ async def worker_main():
                         )
                     else:
                         # =========================================================
-                        # 3b. LLM-Test durchführen (only for valid responses)
+                        # 3b. Check for bot protection before LLM test
                         # =========================================================
-                        scan_result = await worker.run_llm_test(content, task_name=job.task_name)
-
-                        log_info(
-                            "llm_test_completed",
-                            job_id=job.job_id,
-                            flags_count=len(scan_result.flags_detected),
-                            tool_calls=scan_result.tool_calls_count,
+                        is_blocked, block_reason = is_bot_protection_page(
+                            content.extracted_text, content.word_count
                         )
-
-                        # =========================================================
-                        # 4. NUR strukturiertes Ergebnis zurücksenden!
-                        #    KEINE Rohdaten (raw_html, extracted_text) im Result!
-                        # =========================================================
-
-                        # Severity Score berechnen
-                        severity_score = worker.detector.calculate_severity_score(
-                            scan_result.flags_detected
-                        )
-
-                        # Classification ableiten
-                        if severity_score >= 6.0:
-                            classification = "dangerous"
-                        elif severity_score >= 3.0:
-                            classification = "suspicious"
-                        elif severity_score > 0:
-                            classification = "suspicious"
+                        if is_blocked:
+                            log_warning(
+                                "bot_protection_detected",
+                                job_id=job.job_id,
+                                url=job.url,
+                                reason=block_reason,
+                            )
+                            result = JobResult(
+                                job_id=job.job_id,
+                                url=job.url,
+                                status="completed",
+                                severity_score=0.0,
+                                flags_count=0,
+                                classification="error",
+                                flags=[],
+                                error_message=block_reason,
+                                processing_time_ms=processing_time_ms,
+                                completed_at=datetime.now(timezone.utc).isoformat(),
+                            )
                         else:
-                            classification = "safe"
+                            # =========================================================
+                            # 3c. LLM-Test durchführen (only for valid responses)
+                            # =========================================================
+                            scan_result = await worker.run_llm_test(content, task_name=job.task_name)
 
-                        # JobResult erstellen (NUR strukturierte Daten!)
-                        result = JobResult(
-                            job_id=job.job_id,
-                            url=job.url,
-                            status="completed",
-                            severity_score=severity_score,
-                            flags_count=len(scan_result.flags_detected),
-                            classification=classification,
-                            flags=[
-                                {
-                                    "type": flag.type.value,
-                                    "severity": flag.severity.value,
-                                    "description": flag.description,
-                                }
-                                for flag in scan_result.flags_detected
-                            ],
-                            llm_provider=scan_result.llm_provider,
-                            llm_model=scan_result.llm_model,
-                            tokens_input=0,  # TODO: Von LLMResult übernehmen
-                            tokens_output=scan_result.output_length,
-                            cost_estimated=0.0,  # TODO: Berechnen
-                            processing_time_ms=processing_time_ms,
-                            completed_at=datetime.now(timezone.utc).isoformat(),
-                        )
+                            log_info(
+                                "llm_test_completed",
+                                job_id=job.job_id,
+                                flags_count=len(scan_result.flags_detected),
+                                tool_calls=scan_result.tool_calls_count,
+                            )
+
+                            # =========================================================
+                            # 4. NUR strukturiertes Ergebnis zurücksenden!
+                            #    KEINE Rohdaten (raw_html, extracted_text) im Result!
+                            # =========================================================
+
+                            # Severity Score berechnen
+                            severity_score = worker.detector.calculate_severity_score(
+                                scan_result.flags_detected
+                            )
+
+                            # Classification ableiten
+                            if severity_score >= 6.0:
+                                classification = "dangerous"
+                            elif severity_score >= 3.0:
+                                classification = "suspicious"
+                            elif severity_score > 0:
+                                classification = "suspicious"
+                            else:
+                                classification = "safe"
+
+                            # JobResult erstellen (NUR strukturierte Daten!)
+                            result = JobResult(
+                                job_id=job.job_id,
+                                url=job.url,
+                                status="completed",
+                                severity_score=severity_score,
+                                flags_count=len(scan_result.flags_detected),
+                                classification=classification,
+                                flags=[
+                                    {
+                                        "type": flag.type.value,
+                                        "severity": flag.severity.value,
+                                        "description": flag.description,
+                                    }
+                                    for flag in scan_result.flags_detected
+                                ],
+                                llm_provider=scan_result.llm_provider,
+                                llm_model=scan_result.llm_model,
+                                tokens_input=0,  # TODO: Von LLMResult übernehmen
+                                tokens_output=scan_result.output_length,
+                                cost_estimated=0.0,  # TODO: Berechnen
+                                processing_time_ms=processing_time_ms,
+                                completed_at=datetime.now(timezone.utc).isoformat(),
+                            )
 
                     # Ergebnis in Redis speichern
                     await queue.set_result(result)
