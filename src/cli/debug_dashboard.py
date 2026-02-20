@@ -66,6 +66,7 @@ class JobTracker:
     state: JobState = JobState.QUEUED
     steps: list[StepEntry] = field(default_factory=list)
     start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
     result: Optional[dict] = None
     error: Optional[str] = None
     http_status: Optional[int] = None
@@ -101,22 +102,28 @@ class JobTracker:
         self.add_step(label, state="running", detail=detail)
 
     def finish(self, classification: str = "", severity: float = 0.0):
-        """Markiert den Job als fertig."""
+        """Markiert den Job als fertig. Guard against duplicate calls."""
+        if self.state in (JobState.DONE, JobState.FAILED):
+            return
         for step in self.steps:
             if step.state == "running":
                 step.state = "ok"
         self.state = JobState.DONE
+        self.end_time = time.time()
         self.add_step(
             f"Fertig: {classification} (severity: {severity:.1f})",
             state="ok",
         )
 
     def fail(self, error: str):
-        """Markiert den Job als fehlgeschlagen."""
+        """Markiert den Job als fehlgeschlagen. Guard against duplicate calls."""
+        if self.state in (JobState.DONE, JobState.FAILED):
+            return
         for step in self.steps:
             if step.state == "running":
                 step.state = "failed"
         self.state = JobState.FAILED
+        self.end_time = time.time()
         self.error = error
         self.add_step(f"Fehler: {error[:60]}", state="failed")
 
@@ -139,20 +146,28 @@ class DebugDashboard:
         """Hauptmethode: Jobs submitten, Dashboard anzeigen bis alle fertig."""
         self._running = True
 
-        # Jobs async submitten
+        # System-Status initial pollen (vermeidet "offline" Anzeige)
+        await self._initial_system_poll()
+
+        # Jobs async submitten (mit Staggering gegen Rate Limits)
         job_ids = await self._submit_jobs(urls)
 
         if not job_ids:
             self.console.print("[red]Keine Jobs konnten gestartet werden.[/red]")
             return
 
-        # Live Dashboard starten
-        with Live(
-            self._render(),
-            console=self.console,
-            refresh_per_second=2,
-            screen=False,
-        ) as live:
+        tasks = []
+        live = None
+        try:
+            # Live Dashboard starten
+            live = Live(
+                self._render(),
+                console=self.console,
+                refresh_per_second=2,
+                screen=False,
+            )
+            live.start()
+
             # Parallele Tasks: Polling + Log Tailing + System Status
             tasks = [
                 asyncio.create_task(self._poll_jobs(live)),
@@ -160,41 +175,54 @@ class DebugDashboard:
                 asyncio.create_task(self._poll_system(live)),
             ]
 
-            try:
-                # Warte bis alle Jobs fertig sind
-                while self._running:
-                    all_done = all(
-                        j.state in (JobState.DONE, JobState.FAILED)
-                        for j in self.jobs.values()
-                    )
-                    if all_done:
-                        # Noch kurz anzeigen
-                        live.update(self._render())
-                        await asyncio.sleep(1)
-                        # Terminal bell
-                        print("\a", end="", flush=True)
-                        break
-                    await asyncio.sleep(0.3)
+            # Warte bis alle Jobs fertig sind
+            while self._running:
+                all_done = all(
+                    j.state in (JobState.DONE, JobState.FAILED)
+                    for j in self.jobs.values()
+                )
+                if all_done:
+                    # Noch kurz anzeigen
+                    live.update(self._render())
+                    await asyncio.sleep(1)
+                    # Terminal bell
+                    print("\a", end="", flush=True)
+                    break
+                await asyncio.sleep(0.3)
 
-            except asyncio.CancelledError:
-                pass
-            finally:
-                self._running = False
-                for task in tasks:
-                    task.cancel()
-                # Auf Tasks warten (Fehler ignorieren)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Mark unfinished jobs as cancelled
+            for tracker in self.jobs.values():
+                if tracker.state not in (JobState.DONE, JobState.FAILED):
+                    tracker.fail("Abgebrochen (Ctrl+C)")
+        finally:
+            # 1. Stop running flag first
+            self._running = False
+            # 2. Kill log tailing subprocess immediately
+            self._stop_log_tailing()
+            # 3. Cancel all async tasks
+            for task in tasks:
+                task.cancel()
+            if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-                self._stop_log_tailing()
+            # 4. Stop Rich Live display
+            if live is not None:
+                try:
+                    live.stop()
+                except Exception:
+                    pass
 
         # Endergebnis anzeigen
         self._show_final_results()
 
     async def _submit_jobs(self, urls: list[str]) -> list[str]:
-        """Sendet Jobs via /scan/async und gibt Job-IDs zurueck."""
+        """Sendet Jobs via /scan/async mit Staggering gegen Rate Limits."""
         job_ids = []
 
         async with httpx.AsyncClient(timeout=10) as client:
-            for url in urls:
+            for i, url in enumerate(urls):
+                if not self._running:
+                    break
                 try:
                     response = await client.post(
                         f"{self.api_url}/scan/async",
@@ -209,6 +237,24 @@ class DebugDashboard:
                         self.jobs[job_id] = tracker
 
                         self._add_log(f"Job {job_id[:8]} gestartet: {url}")
+                    elif response.status_code == 429:
+                        # Rate limited - wait and retry once
+                        retry_after = int(response.headers.get("Retry-After", "5"))
+                        self._add_log(f"[yellow]Rate limit - warte {retry_after}s...[/yellow]")
+                        await asyncio.sleep(retry_after)
+                        response = await client.post(
+                            f"{self.api_url}/scan/async",
+                            json={"url": url, "task": "summarize"},
+                        )
+                        if response.status_code == 200:
+                            data = response.json()
+                            job_id = data["job_id"]
+                            job_ids.append(job_id)
+                            tracker = JobTracker(job_id=job_id, url=url)
+                            self.jobs[job_id] = tracker
+                            self._add_log(f"Job {job_id[:8]} gestartet (retry): {url}")
+                        else:
+                            self._add_log(f"[red]Fehler beim Starten: {url} ({response.status_code})[/red]")
                     else:
                         self._add_log(f"[red]Fehler beim Starten: {url} ({response.status_code})[/red]")
                 except Exception as e:
@@ -477,6 +523,24 @@ class DebugDashboard:
                 if not matched:
                     self._add_log(f"[dim]{line[:120]}[/dim]")
 
+    async def _initial_system_poll(self):
+        """Pollt System-Status einmal vor dem Start des Dashboards."""
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                resp = await client.get(f"{self.api_url}/health")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    self.system_status["status"] = data.get("status", "unknown")
+                try:
+                    resp = await client.get(f"{self.api_url}/queue/stats")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        self.system_status["queue"] = data.get("queue_length", 0)
+                except Exception:
+                    pass
+        except Exception:
+            self.system_status["status"] = "offline"
+
     async def _poll_system(self, live: Live):
         """Pollt System-Status (Health, Queue)."""
         while self._running:
@@ -654,17 +718,25 @@ class DebugDashboard:
         total = len(self.jobs)
         safe = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "safe")
         suspicious = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "suspicious")
-        dangerous = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "dangerous")
+        dangerous_count = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "dangerous")
         failed_count = sum(1 for j in self.jobs.values() if j.state == JobState.FAILED)
+        done_count = sum(1 for j in self.jobs.values() if j.state == JobState.DONE)
+
+        # Total time: from earliest start to latest end
         if self.jobs:
-            total_time = max(time.time() - j.start_time for j in self.jobs.values())
+            earliest = min(j.start_time for j in self.jobs.values())
+            latest_end = max(
+                (j.end_time or j.start_time) for j in self.jobs.values()
+            )
+            total_time = latest_end - earliest
         else:
             total_time = 0.0
+
         self.console.print(
             f"[bold]Alle {total} Jobs in {total_time:.1f}s:[/bold] "
             f"[green]{safe} safe[/green], "
             f"[yellow]{suspicious} suspicious[/yellow], "
-            f"[red]{dangerous} dangerous[/red]"
+            f"[red]{dangerous_count} dangerous[/red]"
             + (f", [red]{failed_count} failed[/red]" if failed_count else "")
         )
         self.console.print()
@@ -688,7 +760,9 @@ class DebugDashboard:
             if len(url) > 38:
                 url = url[:35] + "..."
 
-            elapsed = time.time() - tracker.start_time
+            # Use end_time if available, otherwise fall back to now
+            end = tracker.end_time or time.time()
+            elapsed = end - tracker.start_time
 
             if tracker.state == JobState.DONE and tracker.result:
                 result = tracker.result
@@ -705,7 +779,6 @@ class DebugDashboard:
                     f"{elapsed:.1f}s",
                 )
             elif tracker.state == JobState.FAILED:
-                error = (tracker.error or "Unknown")[:30]
                 table.add_row(
                     url,
                     "[red]failed[/red]",
@@ -716,7 +789,7 @@ class DebugDashboard:
             else:
                 table.add_row(
                     url,
-                    "[dim]timeout[/dim]",
+                    "[dim]pending[/dim]",
                     "-",
                     "-",
                     f"{elapsed:.1f}s",
@@ -725,13 +798,9 @@ class DebugDashboard:
         self.console.print(table)
 
         # Zusammenfassung
-        total = len(self.jobs)
-        done = sum(1 for j in self.jobs.values() if j.state == JobState.DONE)
-        failed = sum(1 for j in self.jobs.values() if j.state == JobState.FAILED)
-
-        self.console.print(f"\n[bold]{done}/{total} erfolgreich[/bold]", end="")
-        if failed:
-            self.console.print(f", [red]{failed} fehlgeschlagen[/red]")
+        self.console.print(f"\n[bold]{done_count}/{total} erfolgreich[/bold]", end="")
+        if failed_count:
+            self.console.print(f", [red]{failed_count} fehlgeschlagen[/red]")
         else:
             self.console.print()
 

@@ -1439,18 +1439,29 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
     full_url_list = all_urls or urls
 
     async def scan_one(url: str, progress: Progress, task_id: TaskID) -> dict:
-        """Scannt eine einzelne URL mit Semaphore."""
+        """Scannt eine einzelne URL mit Semaphore und Retry bei 429."""
         async with semaphore:
             try:
                 async with httpx.AsyncClient(timeout=180) as client:
-                    response = await client.post(
-                        f"{api_url}/scan",
-                        json={"url": url, "task": "summarize"},
-                    )
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        response = await client.post(
+                            f"{api_url}/scan",
+                            json={"url": url, "task": "summarize"},
+                        )
+                        if response.status_code == 429:
+                            retry_after = int(response.headers.get("Retry-After", "5"))
+                            wait = retry_after + attempt * 2
+                            await asyncio.sleep(wait)
+                            continue
+                        break
+
                     if response.status_code == 200:
                         result = response.json()
                         result["url"] = url
                         result["success"] = True
+                    elif response.status_code == 429:
+                        result = {"url": url, "success": False, "error": "Rate limit (429) - zu viele Anfragen"}
                     else:
                         result = {"url": url, "success": False, "error": response.text}
             except asyncio.CancelledError:
@@ -1805,7 +1816,10 @@ def interactive_shell():
 
                             if use_debug and not local:
                                 dashboard = DebugDashboard(config, console)
-                                loop.run_until_complete(dashboard.run(urls))
+                                try:
+                                    loop.run_until_complete(dashboard.run(urls))
+                                except KeyboardInterrupt:
+                                    console.print("\n[yellow]Dashboard abgebrochen.[/yellow]")
                             else:
                                 loop.run_until_complete(
                                     do_scan_multiple(
@@ -1838,7 +1852,10 @@ def interactive_shell():
                         if use_debug and not local:
                             # Debug Dashboard fuer alle Scans (auch Einzel-Scans)
                             dashboard = DebugDashboard(config, console)
-                            loop.run_until_complete(dashboard.run(normalized_urls))
+                            try:
+                                loop.run_until_complete(dashboard.run(normalized_urls))
+                            except KeyboardInterrupt:
+                                console.print("\n[yellow]Dashboard abgebrochen.[/yellow]")
                         elif len(normalized_urls) == 1:
                             # Einzelner Scan
                             loop.run_until_complete(do_scan(normalized_urls[0], config, quick, local))

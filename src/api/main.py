@@ -136,8 +136,8 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 # Rate limit tiers: path prefix -> requests per minute
 _RATE_LIMITS: dict[str, int] = {
-    "/scan/async": 20,
-    "/scan": 10,
+    "/scan/async": 120,   # Lightweight queue operation, needs high limit for batch
+    "/scan": 30,          # Synchronous scan, heavier but still needs batch support
 }
 _DEFAULT_RATE_LIMIT = 60  # read-only endpoints
 
