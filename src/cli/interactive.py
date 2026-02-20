@@ -8,6 +8,7 @@ Startet automatisch alle benötigten Backend-Services.
 import asyncio
 import json
 import os
+import readline
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -1664,6 +1665,15 @@ def interactive_shell():
 
     console.print("[dim]Tippe 'help' für alle Befehle.[/dim]\n")
 
+    # Readline History einrichten (Pfeiltasten-Navigation)
+    HISTORY_CMD_FILE = CONFIG_DIR / "cmd_history"
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        readline.read_history_file(str(HISTORY_CMD_FILE))
+    except FileNotFoundError:
+        pass
+    readline.set_history_length(500)
+
     # Event Loop für die gesamte Session (vermeidet "Event loop is closed" Fehler)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1672,7 +1682,7 @@ def interactive_shell():
     try:
         while True:
             try:
-                cmd = Prompt.ask("[bold cyan]>[/bold cyan]")
+                cmd = input("\033[1;36m>\033[0m ")
                 cmd = cmd.strip()
 
                 if not cmd:
@@ -1960,6 +1970,11 @@ def interactive_shell():
                 console.print(f"[red]Fehler: {e}[/red]")
 
     finally:
+        # Befehlshistorie speichern
+        try:
+            readline.write_history_file(str(HISTORY_CMD_FILE))
+        except Exception:
+            pass
         # Event Loop sauber schließen
         try:
             # Alle pending tasks canceln
