@@ -1818,7 +1818,7 @@ def interactive_shell():
                             console.print(f"[red]{e}[/red]")
                         except KeyboardInterrupt:
                             console.print("\n[yellow]Scan abgebrochen.[/yellow]")
-                            if checkpoint_file:
+                            if file_path:
                                 console.print("[dim]Fortsetzen mit: resume[/dim]")
                         except Exception as e:
                             console.print(f"[red]Fehler beim Laden der CSV: {e}[/red]")

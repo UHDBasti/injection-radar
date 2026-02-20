@@ -35,7 +35,7 @@ from ..core.database import (
 )
 from sqlalchemy import select
 from ..core.queue import JobQueue, QueueConfig, ScanJob, JobResult
-from ..core.logging import log_info, log_error, log_warning, log_debug, log_error_with_trace
+from ..core.logging import log_info, log_error, log_warning, log_debug, log_error_with_trace, setup_logging
 from ..llm import AnthropicClient, OpenAIClient, LLMResult, DUMMY_TOOLS
 from ..llm.anthropic import (
     SUMMARIZE_SYSTEM_PROMPT,
@@ -370,6 +370,9 @@ async def worker_main():
     """
     global _shutdown_requested
 
+    # Structlog nach stderr ausgeben (Docker captured das für Dashboard-Log-Tailing)
+    setup_logging(verbose=True)
+
     # Signal-Handler registrieren
     signal.signal(signal.SIGTERM, _handle_shutdown_signal)
     signal.signal(signal.SIGINT, _handle_shutdown_signal)
@@ -428,11 +431,13 @@ async def worker_main():
                         url=job.url,
                         text_length=content.text_length,
                         word_count=content.word_count,
+                        http_status=content.http_status,
                     )
 
                     # =========================================================
                     # 2. Rohdaten in Datenbank speichern (nur Subsystem sieht das!)
                     # =========================================================
+                    log_info("saving_to_db", job_id=job.job_id, url=job.url)
                     async with SessionFactory() as session:
                         # URL in DB anlegen oder holen
                         url_id = await get_or_create_url(session, job.url)
@@ -455,7 +460,7 @@ async def worker_main():
                         )
                         session.add(content_db)
                         await session.commit()
-                        log_debug("scraped_content_saved", job_id=job.job_id, url_id=url_id)
+                        log_info("scraped_content_saved", job_id=job.job_id, url_id=url_id)
 
                     # =========================================================
                     # 3. Check HTTP status and content before LLM test
@@ -529,6 +534,7 @@ async def worker_main():
                             # =========================================================
                             # 3c. LLM-Test durchführen (only for valid responses)
                             # =========================================================
+                            log_info("llm_test_started", job_id=job.job_id, url=job.url)
                             scan_result = await worker.run_llm_test(content, task_name=job.task_name)
 
                             log_info(
@@ -536,6 +542,8 @@ async def worker_main():
                                 job_id=job.job_id,
                                 flags_count=len(scan_result.flags_detected),
                                 tool_calls=scan_result.tool_calls_count,
+                                llm_provider=scan_result.llm_provider,
+                                llm_model=scan_result.llm_model,
                             )
 
                             # =========================================================
@@ -597,7 +605,8 @@ async def worker_main():
 
                 except Exception as e:
                     # Fehler-Result senden
-                    log_error_with_trace("job_failed", e)
+                    log_error("job_failed", job_id=job.job_id, error_message=str(e))
+                    log_error_with_trace("job_failed_trace", e)
 
                     error_result = JobResult(
                         job_id=job.job_id,

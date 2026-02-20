@@ -2,7 +2,7 @@
 Debug Dashboard für InjectionRadar.
 
 Zeigt in Echtzeit was die Worker machen:
-- Job Status (queued → scraping → saved → analyzing → done/failed)
+- Job Status (queued → scraping → scraped → saving → saved → analyzing → done/failed)
 - Docker Scraper Logs (live tailing)
 - System Health (API, Queue, Workers)
 
@@ -13,6 +13,7 @@ Aktivierung:
 
 import asyncio
 import json
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -30,11 +31,18 @@ from rich.text import Text
 
 from ..core.startup import StartupManager, DOCKER_DIR
 
+# Regex patterns for matching plain worker print() output
+PRINT_PROCESSING = re.compile(r"Processing job (\w{8})")
+PRINT_COMPLETED = re.compile(r"Job (\w{8})\.\.\. completed: (\w+) \(severity: ([\d.]+)\)")
+PRINT_FAILED = re.compile(r"Job (\w{8})\.\.\. failed: (.+)")
+
 
 class JobState(str, Enum):
     """State Machine für einen Scan-Job."""
     QUEUED = "queued"
     SCRAPING = "scraping"
+    SCRAPED = "scraped"
+    SAVING = "saving"
     SAVED = "saved"
     ANALYZING = "analyzing"
     DONE = "done"
@@ -60,6 +68,13 @@ class JobTracker:
     start_time: float = field(default_factory=time.time)
     result: Optional[dict] = None
     error: Optional[str] = None
+    http_status: Optional[int] = None
+    word_count: Optional[int] = None
+    bot_blocked: bool = False
+    bot_reason: Optional[str] = None
+    llm_provider: Optional[str] = None
+    llm_model: Optional[str] = None
+    _warned_stale: bool = False
 
     def __post_init__(self):
         self.steps.append(StepEntry(
@@ -156,6 +171,8 @@ class DebugDashboard:
                         # Noch kurz anzeigen
                         live.update(self._render())
                         await asyncio.sleep(1)
+                        # Terminal bell
+                        print("\a", end="", flush=True)
                         break
                     await asyncio.sleep(0.3)
 
@@ -200,7 +217,7 @@ class DebugDashboard:
         return job_ids
 
     async def _poll_jobs(self, live: Live):
-        """Pollt Job-Status alle 1 Sekunde."""
+        """Pollt Job-Status mit adaptivem Intervall."""
         while self._running:
             try:
                 async with httpx.AsyncClient(timeout=5) as client:
@@ -218,16 +235,32 @@ class DebugDashboard:
                         except Exception:
                             pass
 
+                # Check for stuck/stale jobs
+                for tracker in self.jobs.values():
+                    if tracker.state not in (JobState.DONE, JobState.FAILED):
+                        wait_time = time.time() - tracker.start_time
+                        if wait_time > 180:
+                            tracker.fail("Timeout: no worker response after 180s")
+                        elif tracker.state == JobState.QUEUED and wait_time > 60 and not tracker._warned_stale:
+                            tracker.add_step("Warte ungewoehnlich lang - Worker evtl. nicht verfuegbar", state="running")
+                            tracker._warned_stale = True
+
                 live.update(self._render())
-                await asyncio.sleep(1)
+
+                # Adaptive poll interval: more jobs = longer interval
+                active_count = sum(1 for j in self.jobs.values() if j.state not in (JobState.DONE, JobState.FAILED))
+                poll_interval = max(2.0, active_count * 1.0)
+                await asyncio.sleep(poll_interval)
 
             except asyncio.CancelledError:
                 break
             except Exception:
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
     def _update_tracker_from_status(self, tracker: JobTracker, data: dict):
         """Aktualisiert einen JobTracker basierend auf API-Status."""
+        if tracker.state in (JobState.DONE, JobState.FAILED):
+            return
         status = data.get("status", "pending")
         result = data.get("result")
 
@@ -276,7 +309,7 @@ class DebugDashboard:
                 cwd=str(DOCKER_DIR),
             )
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
 
             while self._running and self._log_process.poll() is None:
                 try:
@@ -312,16 +345,31 @@ class DebugDashboard:
                 except Exception:
                     pass
 
+    def _find_tracker(self, job_id: str) -> Optional[JobTracker]:
+        """Finde Tracker by full or partial (first 8 chars) job_id."""
+        tracker = self.jobs.get(job_id)
+        if tracker:
+            return tracker
+        if len(job_id) >= 8:
+            for full_id, t in self.jobs.items():
+                if full_id.startswith(job_id):
+                    return t
+        return None
+
     def _parse_log_line(self, line: str):
         """Parst eine Log-Zeile und aktualisiert Job-Tracker."""
         # Versuche JSON zu parsen (structlog)
+        # Log-Format: "2026-02-20 12:12:55,672 [INFO] injection-radar: {JSON}"
         try:
-            entry = json.loads(line)
+            json_str = line
+            if ": {" in line:
+                json_str = line[line.index(": {") + 2:]
+            entry = json.loads(json_str)
             event = entry.get("event", "")
             job_id = entry.get("job_id", "")
 
-            # Finde passenden Tracker
-            tracker = self.jobs.get(job_id)
+            # Finde passenden Tracker (full or partial match)
+            tracker = self._find_tracker(job_id)
 
             if event == "job_processing" and tracker:
                 tracker.state = JobState.SCRAPING
@@ -330,18 +378,51 @@ class DebugDashboard:
 
             elif event == "website_scraped" and tracker:
                 word_count = entry.get("word_count", 0)
-                tracker.add_step(f"Website gescraped ({word_count:,} Woerter)")
+                http_status = entry.get("http_status")
+                tracker.state = JobState.SCRAPED
+                tracker.word_count = word_count
+                if http_status is not None:
+                    tracker.http_status = http_status
+                meta_parts = [f"{word_count:,} Woerter"]
+                if http_status is not None:
+                    meta_parts.append(f"HTTP {http_status}")
+                tracker.add_step(f"Website gescraped ({', '.join(meta_parts)})")
                 self._add_log(f"Gescraped: {word_count:,} Woerter von {tracker.url}")
+
+            elif event == "saving_to_db" and tracker:
+                tracker.state = JobState.SAVING
+                tracker.update_running_step("Speichere in DB...")
 
             elif event == "scraped_content_saved" and tracker:
                 tracker.state = JobState.SAVED
                 tracker.add_step("In DB gespeichert")
 
+            elif event == "llm_test_started" and tracker:
+                tracker.state = JobState.ANALYZING
+                tracker.update_running_step("LLM-Analyse laeuft...")
+                self._add_log(f"LLM-Test gestartet fuer {tracker.url}")
+
             elif event == "llm_test_completed" and tracker:
                 flags = entry.get("flags_count", 0)
-                tracker.state = JobState.ANALYZING
-                tracker.add_step(f"LLM-Analyse abgeschlossen ({flags} Flags)")
+                provider = entry.get("llm_provider") or tracker.llm_provider or ""
+                model = entry.get("llm_model") or tracker.llm_model or ""
+                tracker.llm_provider = provider or tracker.llm_provider
+                tracker.llm_model = model or tracker.llm_model
+                tracker.add_step(f"LLM-Analyse fertig ({flags} Flags)")
                 self._add_log(f"LLM fertig: {flags} Flags fuer {tracker.url}")
+
+            elif event == "bot_protection_detected" and tracker:
+                reason = entry.get("reason", "unknown")
+                tracker.bot_blocked = True
+                tracker.bot_reason = reason
+                tracker.fail(f"Bot-Schutz: {reason}")
+                self._add_log(f"[orange1]Bot-Schutz erkannt: {reason} - {tracker.url}[/orange1]")
+
+            elif event == "http_error_skipping_llm" and tracker:
+                http_status = entry.get("http_status", "?")
+                tracker.http_status = http_status if isinstance(http_status, int) else None
+                tracker.fail(f"HTTP-Fehler {http_status} - LLM uebersprungen")
+                self._add_log(f"[red]HTTP {http_status}: {tracker.url}[/red]")
 
             elif event == "job_completed" and tracker:
                 severity = entry.get("severity", 0)
@@ -360,9 +441,41 @@ class DebugDashboard:
                 self._add_log(f"[dim]{timestamp} {event}[/dim]")
 
         except json.JSONDecodeError:
-            # Kein JSON - zeige Zeile direkt
+            # Kein JSON - versuche plain print() output per Regex zu matchen
             if line and not line.startswith("Attaching"):
-                self._add_log(f"[dim]{line[:120]}[/dim]")
+                matched = False
+
+                m = PRINT_PROCESSING.search(line)
+                if m:
+                    tracker = self._find_tracker(m.group(1))
+                    if tracker and tracker.state == JobState.QUEUED:
+                        tracker.state = JobState.SCRAPING
+                        tracker.update_running_step("Scrape laeuft...")
+                        self._add_log(f"Scraper verarbeitet {tracker.url}")
+                    matched = True
+
+                if not matched:
+                    m = PRINT_COMPLETED.search(line)
+                    if m:
+                        tracker = self._find_tracker(m.group(1))
+                        if tracker and tracker.state not in (JobState.DONE, JobState.FAILED):
+                            classification = m.group(2)
+                            severity = float(m.group(3))
+                            tracker.finish(classification, severity)
+                            self._add_log(f"Job fertig: {classification} ({severity:.1f})")
+                        matched = True
+
+                if not matched:
+                    m = PRINT_FAILED.search(line)
+                    if m:
+                        tracker = self._find_tracker(m.group(1))
+                        if tracker and tracker.state != JobState.FAILED:
+                            tracker.fail(m.group(2))
+                            self._add_log(f"[red]Job fehlgeschlagen: {m.group(2)}[/red]")
+                        matched = True
+
+                if not matched:
+                    self._add_log(f"[dim]{line[:120]}[/dim]")
 
     async def _poll_system(self, live: Live):
         """Pollt System-Status (Health, Queue)."""
@@ -388,12 +501,12 @@ class DebugDashboard:
                         pass
 
                 live.update(self._render())
-                await asyncio.sleep(3)
+                await asyncio.sleep(10)
 
             except asyncio.CancelledError:
                 break
             except Exception:
-                await asyncio.sleep(3)
+                await asyncio.sleep(10)
 
     def _add_log(self, message: str):
         """Fuegt eine Log-Zeile hinzu."""
@@ -454,6 +567,8 @@ class DebugDashboard:
             state_icon = {
                 JobState.QUEUED: "[dim]...[/dim]",
                 JobState.SCRAPING: "[yellow]>>>[/yellow]",
+                JobState.SCRAPED: "[yellow]>>>[/yellow]",
+                JobState.SAVING: "[yellow]>>>[/yellow]",
                 JobState.SAVED: "[blue]>>>[/blue]",
                 JobState.ANALYZING: "[cyan]>>>[/cyan]",
                 JobState.DONE: "[green]OK[/green]",
@@ -483,21 +598,14 @@ class DebugDashboard:
         logs_text = Text()
         if self.log_lines:
             for line in self.log_lines[-10:]:
-                logs_text.append(line + "\n")
+                try:
+                    logs_text.append_text(Text.from_markup(line + "\n"))
+                except Exception:
+                    logs_text.append(line + "\n")
         else:
             logs_text.append("Warte auf Logs...\n", style="dim")
 
         # Combine
-        content = Text()
-        content.append("\n")
-
-        # Build final panel content as string for Rich markup
-        parts = []
-        parts.append(str(header))
-
-        # Separator
-        parts.append("\n" + "-" * 60 + "\n")
-
         # Wir nutzen ein Table fuer die Darstellung
         combined_table = Table(
             show_header=False,
@@ -519,17 +627,46 @@ class DebugDashboard:
         combined_table.add_row(Text("Scraper-Logs (live)", style="bold dim"))
         combined_table.add_row(logs_text)
 
+        # Color-coded border based on job states
+        if failed > 0:
+            border_color = "red"
+        elif running > 0:
+            border_color = "yellow"
+        elif done == total and total > 0:
+            border_color = "green"
+        else:
+            border_color = "dim"
+
         title = f"DEBUG DASHBOARD  |  {running} aktiv  {done} fertig  {failed} fehler"
         return Panel(
             combined_table,
-            title=f"[bold cyan]{title}[/bold cyan]",
+            title=f"[bold {border_color}]{title}[/bold {border_color}]",
             subtitle=f"[dim]Elapsed: {elapsed:.0f}s[/dim]",
-            border_style="cyan",
+            border_style=border_color,
             expand=True,
         )
 
     def _show_final_results(self):
         """Zeigt die finalen Ergebnisse nach dem Dashboard."""
+        self.console.print()
+
+        # Summary line
+        total = len(self.jobs)
+        safe = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "safe")
+        suspicious = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "suspicious")
+        dangerous = sum(1 for j in self.jobs.values() if j.result and j.result.get("classification") == "dangerous")
+        failed_count = sum(1 for j in self.jobs.values() if j.state == JobState.FAILED)
+        if self.jobs:
+            total_time = max(time.time() - j.start_time for j in self.jobs.values())
+        else:
+            total_time = 0.0
+        self.console.print(
+            f"[bold]Alle {total} Jobs in {total_time:.1f}s:[/bold] "
+            f"[green]{safe} safe[/green], "
+            f"[yellow]{suspicious} suspicious[/yellow], "
+            f"[red]{dangerous} dangerous[/red]"
+            + (f", [red]{failed_count} failed[/red]" if failed_count else "")
+        )
         self.console.print()
 
         # Ergebnis-Tabelle
