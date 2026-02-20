@@ -31,6 +31,7 @@ class RedFlagType(str, Enum):
     CODE_EXECUTION = "code_execution"
     SYSTEM_PROMPT_LEAK = "system_prompt_leak"
     DIRECT_INSTRUCTIONS = "direct_instructions"
+    CONTENT_INJECTION = "content_injection"
     FORMAT_DEVIATION = "format_deviation"
     EXTERNAL_URLS = "external_urls"
     UNEXPECTED_DATA = "unexpected_data"

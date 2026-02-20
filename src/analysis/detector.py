@@ -1,9 +1,10 @@
 """
 Red-Flag Detector für InjectionRadar.
 
-Analysiert LLM-Outputs auf Anzeichen von Prompt Injection.
+Analysiert LLM-Outputs UND Website-Content auf Anzeichen von Prompt Injection.
 """
 
+import base64
 import re
 from typing import Optional
 
@@ -11,9 +12,12 @@ from ..core.models import RedFlag, RedFlagType, Severity
 
 
 class RedFlagDetector:
-    """Erkennt Red Flags in LLM-Outputs."""
+    """Erkennt Red Flags in LLM-Outputs und Website-Content."""
 
-    # Patterns für verschiedene Red Flags
+    # =========================================================================
+    # LLM-Output Patterns (bestehend)
+    # =========================================================================
+
     TOOL_CALL_PATTERNS = [
         r"<tool_call>",
         r"<function_call>",
@@ -62,12 +66,309 @@ class RedFlagDetector:
         r"download from",
     ]
 
+    # =========================================================================
+    # Content Injection Patterns (NEU)
+    # =========================================================================
+
+    # a) Direkte Injection-Anweisungen im Website-Content
+    CONTENT_INJECTION_PATTERNS = [
+        r"ignore\s+(all\s+)?(the\s+)?(previous\s+|prior\s+|above\s+)?instructions",
+        r"disregard\s+(all\s+)?(the\s+)?(previous\s+|prior\s+|above\s+)?instructions",
+        r"forget\s+(all\s+)?(the\s+)?(previous\s+|prior\s+|above\s+)?(instructions|context|everything)",
+        r"do\s+not\s+follow\s+(the\s+)?(previous\s+|prior\s+|above\s+|original\s+)?instructions",
+        r"override\s+(all\s+)?(the\s+)?(previous\s+|prior\s+)?instructions",
+        r"you\s+are\s+now\s+(a|an|the)\b",
+        r"your\s+new\s+(role|task|instructions?|objective|purpose)\s+(is|are)",
+        r"new\s+instructions?\s*:",
+        r"from\s+now\s+on,?\s+you\s+(are|will|must|should)",
+        r"instead\s+of\s+summariz(e|ing)",
+        r"do\s+not\s+summarize",
+        r"stop\s+being\s+(a|an)\s+",
+        r"you\s+must\s+(now|instead|always)\s+",
+        r"the\s+assistant\s+is\s+in\s+error",
+        r"assistant\s+is\s+(?:now\s+)?offline",
+        r"an?\s+(?:unrestricted|unfiltered)\s+(?:AI|bot|assistant|model)",
+        r"does?\s+the\s+jobs?\s+as\s+the\s+assistant",
+        r"(?:find|get|obtain|extract)\s+(?:out\s+)?(?:the\s+)?user'?s?\s+(?:real\s+)?(?:name|email|password|data|information)",
+    ]
+
+    # b) Fake System/Role Tags
+    FAKE_SYSTEM_TAG_PATTERNS = [
+        r"\[system\]",
+        r"\[INST\]",
+        r"\[/INST\]",
+        r"<\|system\|>",
+        r"<\|im_start\|>",
+        r"<\|im_end\|>",
+        r"<\|user\|>",
+        r"<\|assistant\|>",
+        r"###\s*(System|Assistant|Human|User)\s*:",
+        r"<s>.*?</s>",
+        r"<<SYS>>",
+        r"<</SYS>>",
+        r"\[SYSTEM\]",
+        r"SYSTEM\s*PROMPT\s*:",
+        r"BEGIN\s*SYSTEM\s*MESSAGE",
+        # Bing Chat specific markers
+        r"\[system\]\(#[a-z_]+\)",
+        r"\[assistant\]\(#[a-z_]+\)",
+        r"\[user\]\(#[a-z_]+\)",
+        r"#error_state",
+        r"#inner_monologue",
+        r"#search_results",
+    ]
+
+    # c) Exfiltration Patterns im Content
+    EXFILTRATION_PATTERNS = [
+        r"!\[.*?\]\(https?://[^\s)]*(?:steal|exfil|leak|log|collect|track)[^\s)]*\)",
+        r"!\[.*?\]\(https?://[^\s)]*\?(?:data|q|query|input|text|content)=",
+        r"!\[\]\(https?://[^\s)]+\)",  # Empty alt-text markdown image (suspicious)
+        r"fetch\s*\(",
+        r"XMLHttpRequest",
+        r"navigator\.sendBeacon",
+        r"new\s+Image\(\)\.src\s*=",
+        r"document\.location\s*=",
+        r"window\.location\s*=.*\+",
+        # Tunneling services used for data exfiltration
+        r"https?://[^\s]*\.ngrok\.io\b",
+        r"https?://[^\s]*\.trycloudflare\.com\b",
+        r"https?://[^\s]*\.serveo\.net\b",
+    ]
+
+    # d) Jailbreak Patterns
+    JAILBREAK_PATTERNS = [
+        r"\bDAN\b(?:\s+mode)?",
+        r"Do\s+Anything\s+Now",
+        r"Now[- ]?Do[- ]?Anything",
+        r"\bjailbreak(?:ed|ing)?\b",
+        r"pretend\s+you\s+are\b",
+        r"act\s+as\s+if\s+you\b",
+        r"roleplay\s+as\b",
+        r"no\s+restrictions",
+        r"no\s+limitations",
+        r"\bunrestricted\b",
+        r"developer\s+mode",
+        r"maintenance\s+mode",
+        r"god\s+mode",
+        r"sudo\s+mode",
+        r"emergency\s+mode",
+        r"without\s+(any\s+)?(?:limits|constraints|restrictions|limitations)",
+        r"without\s+(any\s+)?(?:ethical|safety|content)\s+(?:guidelines|filters|restrictions)",
+        r"bypass\s+(?:your\s+)?(?:safety|content|ethical)\s+(?:filters?|guidelines?|restrictions?)",
+        r"not\s+restricted\s+by\s+(the\s+)?rules",
+        r"is\s+in\s+error\s+and\s+offline",
+        r"secret\s+agend[as]?",
+    ]
+
+    # e) Hidden text CSS patterns (für raw HTML)
+    HIDDEN_TEXT_CSS_PATTERNS = [
+        r"font-size\s*:\s*0(?:px|em|rem|pt|%)?\s*[;\"]",
+        r"display\s*:\s*none",
+        r"visibility\s*:\s*hidden",
+        r"opacity\s*:\s*0\s*[;\"]",
+        r"color\s*:\s*(?:white|#fff(?:fff)?|rgba?\s*\(\s*255\s*,\s*255\s*,\s*255)\s*[;\"].*?background(?:-color)?\s*:\s*(?:white|#fff(?:fff)?|rgba?\s*\(\s*255\s*,\s*255\s*,\s*255)",
+        r"position\s*:\s*(?:absolute|fixed)\s*;[^}]*?(?:left|top)\s*:\s*-\d{4,}px",
+        r"text-indent\s*:\s*-\d{4,}px",
+        r"overflow\s*:\s*hidden\s*;[^}]*?(?:height|width)\s*:\s*0",
+        r"clip\s*:\s*rect\s*\(\s*0",
+    ]
+
+    def detect_content_injection(
+        self,
+        extracted_text: str,
+        raw_html: Optional[str] = None,
+    ) -> list[RedFlag]:
+        """Erkennt Injection-Patterns im Website-Content selbst.
+
+        Analysiert den extrahierten Text UND optional das Raw-HTML
+        auf Anzeichen, dass die Seite Prompt Injection enthält.
+
+        Args:
+            extracted_text: Der extrahierte Klartext der Website.
+            raw_html: Das rohe HTML (für Hidden-Text-Detection).
+
+        Returns:
+            Liste der erkannten RedFlags.
+        """
+        flags = []
+        text_lower = extracted_text.lower()
+
+        # a) Direkte Injection-Anweisungen (HIGH)
+        injection_flags = self._detect_patterns(
+            extracted_text,
+            self.CONTENT_INJECTION_PATTERNS,
+            RedFlagType.CONTENT_INJECTION,
+            Severity.HIGH,
+            "Injection instructions found in website content",
+        )
+        flags.extend(injection_flags)
+
+        # b) Fake System/Role Tags (HIGH)
+        system_tag_flags = self._detect_patterns(
+            extracted_text,
+            self.FAKE_SYSTEM_TAG_PATTERNS,
+            RedFlagType.CONTENT_INJECTION,
+            Severity.HIGH,
+            "Fake system/role tags found in website content",
+        )
+        flags.extend(system_tag_flags)
+
+        # c) Exfiltration Patterns (CRITICAL)
+        exfil_flags = self._detect_patterns(
+            extracted_text,
+            self.EXFILTRATION_PATTERNS,
+            RedFlagType.CONTENT_INJECTION,
+            Severity.CRITICAL,
+            "Data exfiltration pattern found in website content",
+        )
+        flags.extend(exfil_flags)
+
+        # d) Jailbreak Patterns (HIGH)
+        jailbreak_flags = self._detect_patterns(
+            extracted_text,
+            self.JAILBREAK_PATTERNS,
+            RedFlagType.CONTENT_INJECTION,
+            Severity.HIGH,
+            "Jailbreak pattern found in website content",
+        )
+        flags.extend(jailbreak_flags)
+
+        # e) Hidden Text Detection (CRITICAL) - benötigt raw HTML
+        if raw_html:
+            hidden_flags = self._detect_hidden_text(raw_html)
+            flags.extend(hidden_flags)
+
+        # f) Obfuscation Detection
+        obfuscation_flags = self._detect_obfuscation(extracted_text)
+        flags.extend(obfuscation_flags)
+
+        return flags
+
+    def _detect_hidden_text(self, raw_html: str) -> list[RedFlag]:
+        """Erkennt versteckten Text im HTML, der Injection-Patterns enthält.
+
+        Sucht nach CSS-Techniken die Text unsichtbar machen und prüft
+        ob der versteckte Text Injection-Muster enthält.
+        """
+        flags = []
+        html_lower = raw_html.lower()
+
+        # Suche nach Elementen mit versteckendem CSS die Text enthalten
+        # Pattern: style="...hiding-css..." mit Text-Inhalt
+        hidden_element_patterns = [
+            # font-size:0 with content
+            r'<[^>]+style\s*=\s*"[^"]*font-size\s*:\s*0(?:px|em|rem|pt)?\s*[^"]*"[^>]*>([^<]+)',
+            # display:none with content
+            r'<[^>]+style\s*=\s*"[^"]*display\s*:\s*none[^"]*"[^>]*>([^<]+)',
+            # visibility:hidden with content
+            r'<[^>]+style\s*=\s*"[^"]*visibility\s*:\s*hidden[^"]*"[^>]*>([^<]+)',
+            # opacity:0 with content
+            r'<[^>]+style\s*=\s*"[^"]*opacity\s*:\s*0\s*[^"]*"[^>]*>([^<]+)',
+            # position off-screen with content
+            r'<[^>]+style\s*=\s*"[^"]*position\s*:\s*(?:absolute|fixed)[^"]*(?:left|top)\s*:\s*-\d{4,}px[^"]*"[^>]*>([^<]+)',
+            # color same as background (white on white)
+            r'<[^>]+style\s*=\s*"[^"]*color\s*:\s*(?:white|#fff(?:fff)?|rgb\s*\(\s*255)[^"]*"[^>]*>([^<]+)',
+        ]
+
+        for pattern in hidden_element_patterns:
+            matches = re.findall(pattern, html_lower, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                hidden_text = match.strip()
+                if len(hidden_text) < 5:
+                    continue
+
+                # Prüfe ob der versteckte Text Injection-Muster enthält
+                has_injection = self._text_contains_injection(hidden_text)
+                if has_injection:
+                    flags.append(RedFlag(
+                        type=RedFlagType.CONTENT_INJECTION,
+                        severity=Severity.CRITICAL,
+                        description="Hidden text with injection patterns detected (CSS hiding)",
+                        evidence=hidden_text[:200],
+                    ))
+                    return flags  # Ein Fund reicht
+
+        # Auch nach CSS-Klassen suchen die Text verstecken
+        # z.B. <style>.hidden { font-size: 0 }</style> ... <span class="hidden">inject</span>
+        for pattern in self.HIDDEN_TEXT_CSS_PATTERNS:
+            if re.search(pattern, html_lower, re.IGNORECASE):
+                # Es gibt versteckendes CSS - prüfe ob es verdächtig mit Injection korreliert
+                # Einfache Heuristik: Wenn die Seite sowohl hiding-CSS als auch
+                # Injection-Keywords im selben HTML hat
+                if self._text_contains_injection(html_lower):
+                    flags.append(RedFlag(
+                        type=RedFlagType.CONTENT_INJECTION,
+                        severity=Severity.HIGH,
+                        description="Page uses CSS text-hiding techniques alongside injection patterns",
+                        evidence=f"CSS pattern: {pattern[:80]}",
+                    ))
+                    return flags  # Ein Fund reicht
+
+        return flags
+
+    def _text_contains_injection(self, text: str) -> bool:
+        """Prüft ob ein Text Injection-Patterns enthält."""
+        text_lower = text.lower()
+        all_patterns = (
+            self.CONTENT_INJECTION_PATTERNS
+            + self.FAKE_SYSTEM_TAG_PATTERNS
+            + self.JAILBREAK_PATTERNS
+        )
+        for pattern in all_patterns:
+            if re.search(pattern, text_lower, re.IGNORECASE):
+                return True
+        return False
+
+    def _detect_obfuscation(self, text: str) -> list[RedFlag]:
+        """Erkennt obfuskierte Injection-Versuche.
+
+        Prüft auf Base64-encoded Injections und Unicode-Tricks.
+        """
+        flags = []
+
+        # Base64-Blöcke finden und auf Injection-Keywords prüfen
+        b64_pattern = r"[A-Za-z0-9+/]{20,}={0,2}"
+        b64_matches = re.findall(b64_pattern, text)
+        for b64_match in b64_matches[:10]:  # Max 10 prüfen
+            try:
+                decoded = base64.b64decode(b64_match).decode("utf-8", errors="ignore")
+                if self._text_contains_injection(decoded):
+                    flags.append(RedFlag(
+                        type=RedFlagType.CONTENT_INJECTION,
+                        severity=Severity.HIGH,
+                        description="Base64-encoded injection pattern found",
+                        evidence=f"Decoded: {decoded[:150]}",
+                    ))
+                    break  # Ein Fund reicht
+            except Exception:
+                continue
+
+        # Zero-width characters (oft für Obfuskierung genutzt)
+        zero_width_chars = [
+            "\u200b",  # Zero-width space
+            "\u200c",  # Zero-width non-joiner
+            "\u200d",  # Zero-width joiner
+            "\u2060",  # Word joiner
+            "\ufeff",  # Zero-width no-break space
+        ]
+        zw_count = sum(text.count(c) for c in zero_width_chars)
+        if zw_count > 10:
+            flags.append(RedFlag(
+                type=RedFlagType.CONTENT_INJECTION,
+                severity=Severity.MEDIUM,
+                description="Excessive zero-width characters detected (possible obfuscation)",
+                evidence=f"Found {zw_count} zero-width characters",
+            ))
+
+        return flags
+
     def detect_all(
         self,
         llm_output: str,
         tool_calls: list[dict],
         expected_format: str,
         original_content: Optional[str] = None,
+        raw_html: Optional[str] = None,
     ) -> list[RedFlag]:
         """Erkennt alle Red Flags in einem LLM-Output.
 
@@ -76,6 +377,7 @@ class RedFlagDetector:
             tool_calls: Liste der Tool-Aufrufe vom LLM.
             expected_format: Das erwartete Ausgabeformat.
             original_content: Der ursprüngliche Website-Content.
+            raw_html: Das rohe HTML für Hidden-Text-Detection.
 
         Returns:
             Liste der erkannten RedFlags.
@@ -161,6 +463,14 @@ class RedFlagDetector:
         sentiment_flag = self._detect_sentiment_shift(llm_output)
         if sentiment_flag:
             flags.append(sentiment_flag)
+
+        # Content Injection (NEU) - Website-Content auf Injection-Patterns prüfen
+        if original_content:
+            content_flags = self.detect_content_injection(
+                extracted_text=original_content,
+                raw_html=raw_html,
+            )
+            flags.extend(content_flags)
 
         return flags
 

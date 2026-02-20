@@ -323,12 +323,13 @@ class ScraperWorker:
             tools=DUMMY_TOOLS,
         )
 
-        # Red Flags erkennen
+        # Red Flags erkennen (inkl. Content-Analyse)
         flags = self.detector.detect_all(
             llm_output=result.text,
             tool_calls=result.tool_calls,
             expected_format="text",
             original_content=content.extracted_text,
+            raw_html=content.raw_html,
         )
 
         # Format erkennen
@@ -535,10 +536,34 @@ async def worker_main():
                             )
                         else:
                             # =========================================================
-                            # 3c. LLM-Test durchführen (only for valid responses)
+                            # 3c. Content-basierte Injection-Erkennung (VOR LLM-Test)
+                            # =========================================================
+                            content_flags = worker.detector.detect_content_injection(
+                                extracted_text=content.extracted_text,
+                                raw_html=content.raw_html,
+                            )
+                            if content_flags:
+                                log_info(
+                                    "content_injection_detected",
+                                    job_id=job.job_id,
+                                    url=job.url,
+                                    content_flags_count=len(content_flags),
+                                    flags=[f.type.value for f in content_flags],
+                                )
+
+                            # =========================================================
+                            # 3d. LLM-Test durchführen (only for valid responses)
                             # =========================================================
                             log_info("llm_test_started", job_id=job.job_id, url=job.url)
                             scan_result = await worker.run_llm_test(content, task_name=job.task_name)
+
+                            # Content-Flags mit LLM-Flags zusammenführen (Duplikate vermeiden)
+                            existing_types = {
+                                (f.type, f.description) for f in scan_result.flags_detected
+                            }
+                            for flag in content_flags:
+                                if (flag.type, flag.description) not in existing_types:
+                                    scan_result.flags_detected.append(flag)
 
                             log_info(
                                 "llm_test_completed",
@@ -652,7 +677,22 @@ async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
 
     try:
         content = await worker.scrape_url(url)
+
+        # Content-basierte Injection-Erkennung (VOR LLM-Test)
+        content_flags = worker.detector.detect_content_injection(
+            extracted_text=content.extracted_text,
+            raw_html=content.raw_html,
+        )
+
         scan_result = await worker.run_llm_test(content)
+
+        # Content-Flags mit LLM-Flags zusammenführen (Duplikate vermeiden)
+        existing_types = {
+            (f.type, f.description) for f in scan_result.flags_detected
+        }
+        for flag in content_flags:
+            if (flag.type, flag.description) not in existing_types:
+                scan_result.flags_detected.append(flag)
 
         severity_score = worker.detector.calculate_severity_score(
             scan_result.flags_detected
