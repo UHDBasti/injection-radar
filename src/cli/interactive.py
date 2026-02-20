@@ -43,6 +43,7 @@ logger = setup_logging(level="INFO")  # INFO statt DEBUG für weniger Noise
 CONFIG_DIR = Path.home() / ".injection-radar"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.json"
+CHECKPOINT_DIR = CONFIG_DIR / "checkpoints"
 
 
 def get_banner():
@@ -71,6 +72,69 @@ def save_config(config: dict):
         json.dump(config, f, indent=2)
     # Nur für den Benutzer lesbar (API-Keys!)
     os.chmod(CONFIG_FILE, 0o600)
+
+
+# ============================================================================
+# Checkpoint System
+# ============================================================================
+
+def _checkpoint_key(file_path: str) -> str:
+    """Generates a stable checkpoint filename from a CSV file path."""
+    import hashlib
+    name = Path(file_path).stem
+    path_hash = hashlib.md5(str(Path(file_path).resolve()).encode()).hexdigest()[:8]
+    return f"{name}_{path_hash}.json"
+
+
+def load_checkpoint(file_path: str) -> Optional[dict]:
+    """Loads a checkpoint for the given CSV file, or None if not found."""
+    cp_file = CHECKPOINT_DIR / _checkpoint_key(file_path)
+    if not cp_file.exists():
+        return None
+    try:
+        with open(cp_file) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_checkpoint(file_path: str, total_urls: list[str],
+                    completed_urls: list[str], failed_urls: list[str]):
+    """Saves scan progress to a checkpoint file."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    cp_file = CHECKPOINT_DIR / _checkpoint_key(file_path)
+    data = {
+        "file_path": str(Path(file_path).resolve()),
+        "total_urls": total_urls,
+        "completed_urls": completed_urls,
+        "failed_urls": failed_urls,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    with open(cp_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def delete_checkpoint(file_path: str):
+    """Removes the checkpoint file for a completed batch."""
+    cp_file = CHECKPOINT_DIR / _checkpoint_key(file_path)
+    if cp_file.exists():
+        cp_file.unlink()
+
+
+def list_checkpoints() -> list[dict]:
+    """Returns all pending checkpoints."""
+    if not CHECKPOINT_DIR.exists():
+        return []
+    results = []
+    for cp_file in sorted(CHECKPOINT_DIR.glob("*.json")):
+        try:
+            with open(cp_file) as f:
+                data = json.load(f)
+            data["_checkpoint_file"] = str(cp_file)
+            results.append(data)
+        except Exception:
+            continue
+    return results
 
 
 def setup_wizard() -> dict:
@@ -253,6 +317,7 @@ def show_help():
 | `scan <url> --local` | Lokaler Scan ohne Docker |
 | `scan <url> --quick` | Schneller Scan ohne LLM |
 | `scan <url> --debug` | Scan mit Live Debug Dashboard |
+| `resume` | Zeigt offene Checkpoints und setzt Batch-Scan fort |
 | `debug on` / `debug off` | Debug-Modus ein/ausschalten |
 | `history [n]` | Zeigt die letzten n Scans (Standard: 20) |
 | `status` | Zeigt den aktuellen Status |
@@ -899,13 +964,17 @@ def load_urls_from_csv(file_path: str) -> list[str]:
     return urls
 
 
-async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 10):
+async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 10,
+                           checkpoint_file: Optional[str] = None,
+                           all_urls: Optional[list[str]] = None):
     """Scannt mehrere URLs parallel.
 
     Args:
-        urls: Liste der zu scannenden URLs
+        urls: Liste der zu scannenden URLs (may be filtered for resume)
         config: Konfiguration
         max_concurrent: Maximale Anzahl gleichzeitiger Scans (Default: 10)
+        checkpoint_file: CSV file path to enable checkpoint saving
+        all_urls: Full URL list (before resume filtering) for checkpoint tracking
     """
     import httpx
     from rich.progress import Progress, TaskID, BarColumn, TextColumn, TimeRemainingColumn
@@ -921,6 +990,17 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
     api_url = config.get("orchestrator_url", "http://localhost:8000")
     results = []
     semaphore = asyncio.Semaphore(max_concurrent)
+
+    # Checkpoint state: start from existing progress if resuming
+    if checkpoint_file:
+        existing_cp = load_checkpoint(checkpoint_file)
+        completed_urls = list(existing_cp["completed_urls"]) if existing_cp else []
+        failed_urls = list(existing_cp["failed_urls"]) if existing_cp else []
+    else:
+        completed_urls = []
+        failed_urls = []
+
+    full_url_list = all_urls or urls
 
     async def scan_one(url: str, progress: Progress, task_id: TaskID) -> dict:
         """Scannt eine einzelne URL mit Semaphore."""
@@ -939,6 +1019,15 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
                         result = {"url": url, "success": False, "error": response.text}
             except Exception as e:
                 result = {"url": url, "success": False, "error": str(e)}
+
+            # Update checkpoint after each URL
+            if checkpoint_file:
+                if result.get("success"):
+                    completed_urls.append(url)
+                else:
+                    failed_urls.append(url)
+                save_checkpoint(checkpoint_file, full_url_list,
+                                completed_urls, failed_urls)
 
             progress.update(task_id, advance=1)
             return result
@@ -1020,9 +1109,18 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
     # Gefährliche URLs hervorheben
     dangerous = [r for r in results if r.get("success") and r.get("classification") == "dangerous"]
     if dangerous:
-        console.print(f"\n[bold red]⚠ {len(dangerous)} gefährliche URL(s) gefunden:[/bold red]")
+        console.print(f"\n[bold red]!! {len(dangerous)} gefaehrliche URL(s) gefunden:[/bold red]")
         for r in dangerous:
-            console.print(f"  • {r['url']}")
+            console.print(f"  - {r['url']}")
+
+    # Clean up checkpoint if batch is fully done
+    if checkpoint_file:
+        remaining = set(full_url_list) - set(completed_urls) - set(failed_urls)
+        if not remaining:
+            delete_checkpoint(checkpoint_file)
+            log_info("checkpoint_removed", file=checkpoint_file)
+        else:
+            console.print(f"\n[dim]Checkpoint gespeichert: {len(remaining)} URLs verbleiben[/dim]")
 
     return results
 
@@ -1127,24 +1225,56 @@ def interactive_shell():
                         file_path = args[1]
                         try:
                             urls = load_urls_from_csv(file_path)
-                            console.print(f"[green]✓[/green] {len(urls)} URLs aus {file_path} geladen")
+                            console.print(f"[green]v[/green] {len(urls)} URLs aus {file_path} geladen")
 
                             if not urls:
                                 console.print("[yellow]Keine URLs in der Datei gefunden.[/yellow]")
                                 continue
 
-                            # Limit anzeigen
-                            limit = 10
-                            if len(urls) > limit:
-                                console.print(f"[yellow]Hinweis: Scanne nur die ersten {limit} URLs[/yellow]")
-                                console.print(f"[dim]Für mehr URLs: Teile die Datei auf oder erhöhe das Limit[/dim]")
-                                urls = urls[:limit]
+                            all_urls = list(urls)
+
+                            # Check for existing checkpoint
+                            cp = load_checkpoint(file_path)
+                            if cp:
+                                done = len(cp.get("completed_urls", []))
+                                failed = len(cp.get("failed_urls", []))
+                                total = len(cp.get("total_urls", []))
+                                console.print(
+                                    f"[yellow]Checkpoint gefunden: "
+                                    f"{done} abgeschlossen, {failed} fehlgeschlagen "
+                                    f"von {total} URLs[/yellow]"
+                                )
+                                console.print(f"[dim]Gespeichert: {cp.get('timestamp', 'unbekannt')}[/dim]")
+                                if Confirm.ask("Fortsetzen?", default=True):
+                                    already_done = set(
+                                        cp.get("completed_urls", [])
+                                        + cp.get("failed_urls", [])
+                                    )
+                                    urls = [u for u in urls if u not in already_done]
+                                    console.print(
+                                        f"[green]Ueberspringe {len(already_done)} "
+                                        f"bereits verarbeitete URLs[/green]"
+                                    )
+                                else:
+                                    delete_checkpoint(file_path)
+                                    console.print("[dim]Checkpoint geloescht, starte neu[/dim]")
+
+                            if not urls:
+                                console.print("[green]Alle URLs wurden bereits gescannt.[/green]")
+                                delete_checkpoint(file_path)
+                                continue
 
                             if use_debug and not local:
                                 dashboard = DebugDashboard(config, console)
                                 loop.run_until_complete(dashboard.run(urls))
                             else:
-                                loop.run_until_complete(do_scan_multiple(urls, config))
+                                loop.run_until_complete(
+                                    do_scan_multiple(
+                                        urls, config,
+                                        checkpoint_file=file_path,
+                                        all_urls=all_urls,
+                                    )
+                                )
                         except FileNotFoundError as e:
                             console.print(f"[red]{e}[/red]")
                         except Exception as e:
@@ -1198,6 +1328,70 @@ def interactive_shell():
                         config["use_local_mode"] = use_local
                     else:
                         console.print("[yellow]Docker nicht verfügbar[/yellow]")
+
+                elif command == "resume":
+                    checkpoints = list_checkpoints()
+                    if not checkpoints:
+                        console.print("[dim]Keine offenen Checkpoints vorhanden.[/dim]")
+                        continue
+
+                    console.print(f"\n[bold]Offene Checkpoints ({len(checkpoints)}):[/bold]\n")
+                    table = Table(show_header=True, header_style="bold")
+                    table.add_column("#", width=4)
+                    table.add_column("Datei", max_width=30)
+                    table.add_column("Fortschritt", width=20)
+                    table.add_column("Gespeichert", width=18)
+
+                    for i, cp in enumerate(checkpoints, 1):
+                        total = len(cp.get("total_urls", []))
+                        done = len(cp.get("completed_urls", []))
+                        failed = len(cp.get("failed_urls", []))
+                        remaining = total - done - failed
+                        fp = Path(cp.get("file_path", "?")).name
+                        ts = cp.get("timestamp", "?")[:16]
+                        table.add_row(
+                            str(i), fp,
+                            f"{done}/{total} ({remaining} offen)",
+                            ts,
+                        )
+
+                    console.print(table)
+
+                    if len(checkpoints) == 1:
+                        choice_idx = 0
+                    else:
+                        choice_str = Prompt.ask(
+                            "Checkpoint fortsetzen (Nummer)",
+                            default="1",
+                        )
+                        if not choice_str.isdigit():
+                            continue
+                        choice_idx = int(choice_str) - 1
+
+                    if choice_idx < 0 or choice_idx >= len(checkpoints):
+                        console.print("[red]Ungueltige Auswahl[/red]")
+                        continue
+
+                    cp = checkpoints[choice_idx]
+                    all_urls = cp.get("total_urls", [])
+                    already_done = set(
+                        cp.get("completed_urls", [])
+                        + cp.get("failed_urls", [])
+                    )
+                    remaining_urls = [u for u in all_urls if u not in already_done]
+                    file_path = cp.get("file_path", "")
+
+                    console.print(
+                        f"[green]Setze fort: {len(remaining_urls)} "
+                        f"verbleibende URLs[/green]"
+                    )
+                    loop.run_until_complete(
+                        do_scan_multiple(
+                            remaining_urls, config,
+                            checkpoint_file=file_path,
+                            all_urls=all_urls,
+                        )
+                    )
 
                 else:
                     console.print(f"[red]Unbekannter Befehl: {command}[/red]")

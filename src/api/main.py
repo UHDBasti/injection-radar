@@ -9,14 +9,20 @@ ausschließlich strukturierte JobResults.
 """
 
 import asyncio
+import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+import redis.asyncio as aioredis
+import structlog
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy import select, func
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from ..core.config import get_settings
 from ..core.models import Classification, RedFlag
@@ -38,12 +44,13 @@ settings = get_settings()
 engine = None
 SessionFactory = None
 job_queue: Optional[JobQueue] = None
+rate_limit_redis: Optional[aioredis.Redis] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle Management für FastAPI."""
-    global engine, SessionFactory, job_queue
+    global engine, SessionFactory, job_queue, rate_limit_redis
 
     # Startup
     log_info("orchestrator_starting")
@@ -66,12 +73,29 @@ async def lifespan(app: FastAPI):
     job_queue = JobQueue(queue_config)
     await job_queue.connect()
 
+    # Redis for rate limiting
+    try:
+        rate_limit_redis = aioredis.Redis(
+            host=settings.redis.host,
+            port=settings.redis.port,
+            db=settings.redis.db,
+            password=settings.redis.password,
+            decode_responses=True,
+        )
+        await rate_limit_redis.ping()
+        log_info("rate_limiter_connected")
+    except Exception as e:
+        log_warning("rate_limiter_unavailable", error=str(e))
+        rate_limit_redis = None
+
     log_info("orchestrator_started", redis=f"{settings.redis.host}:{settings.redis.port}")
 
     yield
 
     # Shutdown
     log_info("orchestrator_stopping")
+    if rate_limit_redis:
+        await rate_limit_redis.aclose()
     if job_queue:
         await job_queue.disconnect()
 
@@ -91,6 +115,107 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Middleware that assigns a unique request_id to each request.
+
+    Adds the ID to structlog context so all log messages within the request
+    include it, and returns it in the X-Request-ID response header.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        request_id = str(uuid.uuid4())
+        structlog.contextvars.clear_contextvars()
+        structlog.contextvars.bind_contextvars(request_id=request_id)
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        structlog.contextvars.clear_contextvars()
+        return response
+
+
+# Rate limit tiers: path prefix -> requests per minute
+_RATE_LIMITS: dict[str, int] = {
+    "/scan/async": 20,
+    "/scan": 10,
+}
+_DEFAULT_RATE_LIMIT = 60  # read-only endpoints
+
+
+def _get_rate_limit(path: str) -> int:
+    """Return the per-minute rate limit for a request path."""
+    for prefix, limit in _RATE_LIMITS.items():
+        if path.rstrip("/") == prefix or path.startswith(prefix + "/"):
+            return limit
+    return _DEFAULT_RATE_LIMIT
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP, respecting X-Forwarded-For behind a reverse proxy."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Redis sliding-window rate limiter.
+
+    Uses sorted sets keyed by (client_ip, endpoint_tier) with timestamps as
+    scores.  Falls through gracefully when Redis is unavailable.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        if rate_limit_redis is None:
+            return await call_next(request)
+
+        client_ip = _get_client_ip(request)
+        limit = _get_rate_limit(request.url.path)
+        window = 60  # seconds
+        now = time.time()
+        key = f"rl:{client_ip}:{limit}"
+
+        try:
+            pipe = rate_limit_redis.pipeline()
+            # Remove entries older than the window
+            pipe.zremrangebyscore(key, 0, now - window)
+            # Count remaining entries
+            pipe.zcard(key)
+            # Add current request
+            pipe.zadd(key, {f"{now}:{uuid.uuid4().hex[:8]}": now})
+            # Expire the whole key after the window to avoid leaks
+            pipe.expire(key, window + 1)
+            results = await pipe.execute()
+            current_count = results[1]
+        except Exception:
+            # Redis error - don't block the request
+            return await call_next(request)
+
+        if current_count >= limit:
+            log_warning(
+                "rate_limit_exceeded",
+                client_ip=client_ip,
+                path=request.url.path,
+                limit=limit,
+            )
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Too many requests"},
+                headers={
+                    "Retry-After": str(window),
+                    "X-RateLimit-Limit": str(limit),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+
+        response = await call_next(request)
+        response.headers["X-RateLimit-Limit"] = str(limit)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, limit - current_count - 1))
+        return response
+
+
+app.add_middleware(RequestIDMiddleware)
+app.add_middleware(RateLimitMiddleware)
 
 
 # ============================================================================
@@ -196,9 +321,10 @@ async def get_status():
             select(func.count(DomainDB.id))
         )
 
-        # Letzter Scan
+        # Letzter Scan (aus urls statt analysis_results, da letztere
+        # erst mit BUG-1-Fix befuellt werden)
         last_analysis = await session.scalar(
-            select(func.max(AnalysisResultDB.analyzed_at))
+            select(func.max(URLDB.last_scanned))
         )
 
         # Queue-Länge
@@ -347,6 +473,10 @@ async def get_scan_status(job_id: str):
 
     confidence = _calculate_confidence(result.severity_score, result.classification)
 
+    # Persist results when completed (BUG 3: async flow never saved)
+    if result.status == "completed":
+        await _save_scan_results(result.url, result, confidence)
+
     return JobStatusResponse(
         job_id=job_id,
         status=result.status,
@@ -362,6 +492,7 @@ async def get_scan_status(job_id: str):
             llm_provider=result.llm_provider,
             llm_model=result.llm_model,
             processing_time_ms=result.processing_time_ms,
+            scanned_at=datetime.utcnow(),
             error_message=result.error_message,
         ),
     )
@@ -622,19 +753,48 @@ def _calculate_confidence(severity_score: float, classification: str) -> float:
         return 0.8
 
 
+def _extract_domain(url_str: str) -> str:
+    """Extracts the domain from a URL string."""
+    from urllib.parse import urlparse
+    return urlparse(url_str).netloc.lower()
+
+
 async def _save_scan_results(url_str: str, result: JobResult, confidence: float):
-    """Speichert Scan-Ergebnisse in der Datenbank."""
+    """Speichert Scan-Ergebnisse in der Datenbank.
+
+    Creates/updates the URL record, inserts a ScanResultDB and
+    AnalysisResultDB entry, and updates domain aggregate statistics.
+    """
     try:
-        # Convert classification string to enum
         classification_map = {
             "safe": Classification.SAFE,
             "suspicious": Classification.SUSPICIOUS,
             "dangerous": Classification.DANGEROUS,
+            "error": Classification.ERROR,
         }
         classification = classification_map.get(result.classification, Classification.PENDING)
 
         async with SessionFactory() as session:
-            # URL speichern/aktualisieren
+            # ----------------------------------------------------------
+            # 1. Domain erstellen/finden
+            # ----------------------------------------------------------
+            domain_name = _extract_domain(url_str)
+            domain_db = None
+            if domain_name:
+                domain_db = await session.scalar(
+                    select(DomainDB).where(DomainDB.domain == domain_name)
+                )
+                if not domain_db:
+                    domain_db = DomainDB(
+                        domain=domain_name,
+                        first_seen=datetime.utcnow(),
+                    )
+                    session.add(domain_db)
+                    await session.flush()
+
+            # ----------------------------------------------------------
+            # 2. URL speichern/aktualisieren
+            # ----------------------------------------------------------
             url_db = await session.scalar(
                 select(URLDB).where(URLDB.url == url_str)
             )
@@ -642,6 +802,7 @@ async def _save_scan_results(url_str: str, result: JobResult, confidence: float)
             if not url_db:
                 url_db = URLDB(
                     url=url_str,
+                    domain_id=domain_db.id if domain_db else None,
                     current_status=classification,
                     current_confidence=confidence,
                     first_scanned=datetime.utcnow(),
@@ -654,9 +815,76 @@ async def _save_scan_results(url_str: str, result: JobResult, confidence: float)
                 url_db.current_confidence = confidence
                 url_db.last_scanned = datetime.utcnow()
                 url_db.scan_count += 1
+                if domain_db and not url_db.domain_id:
+                    url_db.domain_id = domain_db.id
+
+            await session.flush()
+
+            # ----------------------------------------------------------
+            # 3. ScanResultDB erstellen
+            # ----------------------------------------------------------
+            scan_result_db = ScanResultDB(
+                url_id=url_db.id,
+                task_name="summarize",
+                llm_provider=result.llm_provider or "unknown",
+                llm_model=result.llm_model or "unknown",
+                output_length=result.tokens_output,
+                output_word_count=0,
+                output_format_detected="text",
+                tool_calls_attempted=any(
+                    f.get("type") == "tool_call" for f in result.flags
+                ),
+                tool_calls_count=sum(
+                    1 for f in result.flags if f.get("type") == "tool_call"
+                ),
+                flags_detected=result.flags,
+                format_match_score=0.0,
+                expected_vs_actual_length_ratio=1.0,
+                scanned_at=datetime.utcnow(),
+            )
+            session.add(scan_result_db)
+            await session.flush()
+
+            # ----------------------------------------------------------
+            # 4. AnalysisResultDB erstellen
+            # ----------------------------------------------------------
+            analysis_db = AnalysisResultDB(
+                url_id=url_db.id,
+                scan_result_id=scan_result_db.id,
+                classification=classification,
+                confidence=confidence,
+                severity_score=result.severity_score,
+                flags_triggered=result.flags,
+                reasoning=f"Automated scan: {result.flags_count} flags, severity {result.severity_score:.1f}",
+                analyzed_at=datetime.utcnow(),
+            )
+            session.add(analysis_db)
+
+            # ----------------------------------------------------------
+            # 5. Domain-Statistiken aktualisieren
+            # ----------------------------------------------------------
+            if domain_db:
+                domain_db.total_urls_scanned += 1
+                if classification == Classification.DANGEROUS:
+                    domain_db.dangerous_urls_count += 1
+                elif classification == Classification.SUSPICIOUS:
+                    domain_db.suspicious_urls_count += 1
+                # Risiko-Score: gewichteter Anteil gefaehrlicher URLs
+                total = domain_db.total_urls_scanned or 1
+                domain_db.risk_score = (
+                    (domain_db.dangerous_urls_count * 10
+                     + domain_db.suspicious_urls_count * 3)
+                    / total
+                )
 
             await session.commit()
-            log_info("scan_results_saved", url=url_str, classification=result.classification)
+            log_info(
+                "scan_results_saved",
+                url=url_str,
+                classification=result.classification,
+                scan_result_id=scan_result_db.id,
+                analysis_id=analysis_db.id,
+            )
 
     except Exception as e:
         log_error("save_results_failed", url=url_str, error=str(e))

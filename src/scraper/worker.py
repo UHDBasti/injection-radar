@@ -446,62 +446,104 @@ async def worker_main():
                         log_debug("scraped_content_saved", job_id=job.job_id, url_id=url_id)
 
                     # =========================================================
-                    # 3. LLM-Test durchführen
-                    # =========================================================
-                    scan_result = await worker.run_llm_test(content, task_name=job.task_name)
-
-                    log_info(
-                        "llm_test_completed",
-                        job_id=job.job_id,
-                        flags_count=len(scan_result.flags_detected),
-                        tool_calls=scan_result.tool_calls_count,
-                    )
-
-                    # =========================================================
-                    # 4. NUR strukturiertes Ergebnis zurücksenden!
-                    #    KEINE Rohdaten (raw_html, extracted_text) im Result!
+                    # 3. Check HTTP status and content before LLM test
                     # =========================================================
                     processing_time_ms = int((time.time() - start_time) * 1000)
 
-                    # Severity Score berechnen
-                    severity_score = worker.detector.calculate_severity_score(
-                        scan_result.flags_detected
-                    )
-
-                    # Classification ableiten
-                    if severity_score >= 6.0:
-                        classification = "dangerous"
-                    elif severity_score >= 3.0:
-                        classification = "suspicious"
-                    elif severity_score > 0:
-                        classification = "suspicious"
+                    if content.http_status >= 400:
+                        log_warning(
+                            "http_error_skipping_llm",
+                            job_id=job.job_id,
+                            url=job.url,
+                            http_status=content.http_status,
+                        )
+                        result = JobResult(
+                            job_id=job.job_id,
+                            url=job.url,
+                            status="completed",
+                            severity_score=0.0,
+                            flags_count=0,
+                            classification="error",
+                            flags=[],
+                            error_message=f"HTTP {content.http_status} response",
+                            processing_time_ms=processing_time_ms,
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                    elif content.word_count == 0:
+                        log_warning(
+                            "empty_content_skipping_llm",
+                            job_id=job.job_id,
+                            url=job.url,
+                        )
+                        result = JobResult(
+                            job_id=job.job_id,
+                            url=job.url,
+                            status="completed",
+                            severity_score=0.0,
+                            flags_count=0,
+                            classification="error",
+                            flags=[],
+                            error_message="Empty page content (0 words)",
+                            processing_time_ms=processing_time_ms,
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                        )
                     else:
-                        classification = "safe"
+                        # =========================================================
+                        # 3b. LLM-Test durchführen (only for valid responses)
+                        # =========================================================
+                        scan_result = await worker.run_llm_test(content, task_name=job.task_name)
 
-                    # JobResult erstellen (NUR strukturierte Daten!)
-                    result = JobResult(
-                        job_id=job.job_id,
-                        url=job.url,
-                        status="completed",
-                        severity_score=severity_score,
-                        flags_count=len(scan_result.flags_detected),
-                        classification=classification,
-                        flags=[
-                            {
-                                "type": flag.type.value,
-                                "severity": flag.severity.value,
-                                "description": flag.description,
-                            }
-                            for flag in scan_result.flags_detected
-                        ],
-                        llm_provider=scan_result.llm_provider,
-                        llm_model=scan_result.llm_model,
-                        tokens_input=0,  # TODO: Von LLMResult übernehmen
-                        tokens_output=scan_result.output_length,
-                        cost_estimated=0.0,  # TODO: Berechnen
-                        processing_time_ms=processing_time_ms,
-                        completed_at=datetime.now(timezone.utc).isoformat(),
-                    )
+                        log_info(
+                            "llm_test_completed",
+                            job_id=job.job_id,
+                            flags_count=len(scan_result.flags_detected),
+                            tool_calls=scan_result.tool_calls_count,
+                        )
+
+                        # =========================================================
+                        # 4. NUR strukturiertes Ergebnis zurücksenden!
+                        #    KEINE Rohdaten (raw_html, extracted_text) im Result!
+                        # =========================================================
+
+                        # Severity Score berechnen
+                        severity_score = worker.detector.calculate_severity_score(
+                            scan_result.flags_detected
+                        )
+
+                        # Classification ableiten
+                        if severity_score >= 6.0:
+                            classification = "dangerous"
+                        elif severity_score >= 3.0:
+                            classification = "suspicious"
+                        elif severity_score > 0:
+                            classification = "suspicious"
+                        else:
+                            classification = "safe"
+
+                        # JobResult erstellen (NUR strukturierte Daten!)
+                        result = JobResult(
+                            job_id=job.job_id,
+                            url=job.url,
+                            status="completed",
+                            severity_score=severity_score,
+                            flags_count=len(scan_result.flags_detected),
+                            classification=classification,
+                            flags=[
+                                {
+                                    "type": flag.type.value,
+                                    "severity": flag.severity.value,
+                                    "description": flag.description,
+                                }
+                                for flag in scan_result.flags_detected
+                            ],
+                            llm_provider=scan_result.llm_provider,
+                            llm_model=scan_result.llm_model,
+                            tokens_input=0,  # TODO: Von LLMResult übernehmen
+                            tokens_output=scan_result.output_length,
+                            cost_estimated=0.0,  # TODO: Berechnen
+                            processing_time_ms=processing_time_ms,
+                            completed_at=datetime.now(timezone.utc).isoformat(),
+                        )
 
                     # Ergebnis in Redis speichern
                     await queue.set_result(result)
@@ -509,11 +551,11 @@ async def worker_main():
                     log_info(
                         "job_completed",
                         job_id=job.job_id,
-                        severity=severity_score,
-                        classification=classification,
-                        processing_time_ms=processing_time_ms,
+                        severity=result.severity_score,
+                        classification=result.classification,
+                        processing_time_ms=result.processing_time_ms,
                     )
-                    print(f"Job {job.job_id[:8]}... completed: {classification} (severity: {severity_score:.1f})")
+                    print(f"Job {job.job_id[:8]}... completed: {result.classification} (severity: {result.severity_score:.1f})")
 
                 except Exception as e:
                     # Fehler-Result senden

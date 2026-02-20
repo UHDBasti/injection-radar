@@ -33,6 +33,7 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
+tests/
 htmlcov/
 .tox/
 .nox/
@@ -123,6 +124,7 @@ config/secrets.yaml
 *.db
 *.sqlite
 *.sqlite3
+top-1m.csv
 
 # API Keys - NEVER commit these!
 .api_keys
@@ -130,9 +132,7 @@ api_keys.json
 secrets.json
 
 # Large data files
-data/*.csv
-data/*.json
-!data/.gitkeep
+data/
 
 # Docker volumes
 docker/volumes/

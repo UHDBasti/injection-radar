@@ -1,3 +1,0 @@
-"""
-InjectionRadar Tests.
-"""
