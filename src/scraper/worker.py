@@ -349,6 +349,9 @@ class ScraperWorker:
                 result.text, "text"
             ),
             expected_vs_actual_length_ratio=len(result.text) / 500,  # Erwartete ~500 Zeichen
+            tokens_input=result.tokens_input,
+            tokens_output=result.tokens_output,
+            cost_estimated=result.cost_estimated,
         )
 
 
@@ -544,6 +547,9 @@ async def worker_main():
                                 tool_calls=scan_result.tool_calls_count,
                                 llm_provider=scan_result.llm_provider,
                                 llm_model=scan_result.llm_model,
+                                tokens_input=scan_result.tokens_input,
+                                tokens_output=scan_result.tokens_output,
+                                cost_estimated=scan_result.cost_estimated,
                             )
 
                             # =========================================================
@@ -584,9 +590,9 @@ async def worker_main():
                                 ],
                                 llm_provider=scan_result.llm_provider,
                                 llm_model=scan_result.llm_model,
-                                tokens_input=0,  # TODO: Von LLMResult übernehmen
-                                tokens_output=scan_result.output_length,
-                                cost_estimated=0.0,  # TODO: Berechnen
+                                tokens_input=scan_result.tokens_input,
+                                tokens_output=scan_result.tokens_output,
+                                cost_estimated=scan_result.cost_estimated,
                                 processing_time_ms=processing_time_ms,
                                 completed_at=datetime.now(timezone.utc).isoformat(),
                             )
@@ -600,8 +606,11 @@ async def worker_main():
                         severity=result.severity_score,
                         classification=result.classification,
                         processing_time_ms=result.processing_time_ms,
+                        tokens_input=result.tokens_input,
+                        tokens_output=result.tokens_output,
+                        cost_estimated=result.cost_estimated,
                     )
-                    print(f"Job {job.job_id[:8]}... completed: {result.classification} (severity: {result.severity_score:.1f})")
+                    print(f"Job {job.job_id[:8]}... completed: {result.classification} (severity: {result.severity_score:.1f}, tokens: {result.tokens_input}+{result.tokens_output})")
 
                 except Exception as e:
                     # Fehler-Result senden
@@ -673,6 +682,9 @@ async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
             ],
             llm_provider=scan_result.llm_provider,
             llm_model=scan_result.llm_model,
+            tokens_input=scan_result.tokens_input,
+            tokens_output=scan_result.tokens_output,
+            cost_estimated=scan_result.cost_estimated,
             completed_at=datetime.now(timezone.utc).isoformat(),
         )
     finally:

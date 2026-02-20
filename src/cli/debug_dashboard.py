@@ -348,11 +348,24 @@ class DebugDashboard:
                 classification = result.get("classification", "unknown")
                 severity = result.get("severity_score", 0) or 0
 
+                # Token/Cost-Info extrahieren
+                tracker.llm_provider = result.get("llm_provider")
+                tracker.llm_model = result.get("llm_model")
+
+                tokens_in = result.get("tokens_input", 0) or 0
+                tokens_out = result.get("tokens_output", 0) or 0
+                cost = result.get("cost_estimated", 0.0) or 0.0
+
                 if status == "completed":
+                    token_info = ""
+                    if tokens_in or tokens_out:
+                        token_info = f" | {tokens_in}+{tokens_out} tokens"
+                    if cost > 0:
+                        token_info += f" (${cost:.4f})"
                     tracker.finish(classification, severity)
                     self._add_log(
                         f"Job {tracker.job_id[:8]} fertig: "
-                        f"{classification} (severity: {severity:.1f})"
+                        f"{classification} (severity: {severity:.1f}){token_info}"
                     )
                 else:
                     error = result.get("error_message", "Unknown error")
@@ -481,8 +494,11 @@ class DebugDashboard:
                 model = entry.get("llm_model") or tracker.llm_model or ""
                 tracker.llm_provider = provider or tracker.llm_provider
                 tracker.llm_model = model or tracker.llm_model
-                tracker.add_step(f"LLM-Analyse fertig ({flags} Flags)")
-                self._add_log(f"LLM fertig: {flags} Flags fuer {tracker.url}")
+                tokens_in = entry.get("tokens_input", 0)
+                tokens_out = entry.get("tokens_output", 0)
+                token_str = f", {tokens_in}+{tokens_out} tokens" if (tokens_in or tokens_out) else ""
+                tracker.add_step(f"LLM-Analyse fertig ({flags} Flags{token_str})")
+                self._add_log(f"LLM fertig: {flags} Flags{token_str} fuer {tracker.url}")
 
             elif event == "bot_protection_detected" and tracker:
                 reason = entry.get("reason", "unknown")
@@ -500,8 +516,16 @@ class DebugDashboard:
             elif event == "job_completed" and tracker:
                 severity = entry.get("severity", 0)
                 classification = entry.get("classification", "unknown")
+                tokens_in = entry.get("tokens_input", 0)
+                tokens_out = entry.get("tokens_output", 0)
+                cost = entry.get("cost_estimated", 0.0)
                 tracker.finish(classification, severity)
-                self._add_log(f"Job fertig: {classification} ({severity:.1f})")
+                token_info = ""
+                if tokens_in or tokens_out:
+                    token_info = f" | {tokens_in}+{tokens_out} tokens"
+                if cost and cost > 0:
+                    token_info += f" (${cost:.4f})"
+                self._add_log(f"Job fertig: {classification} ({severity:.1f}){token_info}")
 
             elif event == "job_failed" and tracker:
                 error = entry.get("error_message", "unknown")
@@ -775,10 +799,12 @@ class DebugDashboard:
 
         # Ergebnis-Tabelle
         table = Table(show_header=True, header_style="bold", title="Scan-Ergebnisse")
-        table.add_column("URL", max_width=40)
+        table.add_column("URL", max_width=35)
         table.add_column("Status", width=12)
         table.add_column("Severity", justify="right", width=8)
         table.add_column("Flags", justify="right", width=6)
+        table.add_column("Tokens", justify="right", width=12)
+        table.add_column("Cost", justify="right", width=8)
         table.add_column("Zeit", justify="right", width=8)
 
         status_colors = {
@@ -787,10 +813,14 @@ class DebugDashboard:
             "dangerous": "red",
         }
 
+        total_tokens_in = 0
+        total_tokens_out = 0
+        total_cost = 0.0
+
         for tracker in self.jobs.values():
             url = tracker.url
-            if len(url) > 38:
-                url = url[:35] + "..."
+            if len(url) > 33:
+                url = url[:30] + "..."
 
             # Use end_time if available, otherwise fall back to now
             end = tracker.end_time or time.time()
@@ -803,17 +833,31 @@ class DebugDashboard:
                 severity = result.get("severity_score", 0) or 0
                 flags_list = result.get("flags") or []
 
+                tokens_in = result.get("tokens_input", 0) or 0
+                tokens_out = result.get("tokens_output", 0) or 0
+                cost = result.get("cost_estimated", 0.0) or 0.0
+                total_tokens_in += tokens_in
+                total_tokens_out += tokens_out
+                total_cost += cost
+
+                tokens_str = f"{tokens_in}+{tokens_out}" if (tokens_in or tokens_out) else "-"
+                cost_str = f"${cost:.4f}" if cost > 0 else "-"
+
                 table.add_row(
                     url,
                     f"[{color}]{classification}[/{color}]",
                     f"{severity:.1f}",
                     str(len(flags_list)),
+                    tokens_str,
+                    cost_str,
                     f"{elapsed:.1f}s",
                 )
             elif tracker.state == JobState.FAILED:
                 table.add_row(
                     url,
                     "[red]failed[/red]",
+                    "-",
+                    "-",
                     "-",
                     "-",
                     f"{elapsed:.1f}s",
@@ -824,13 +868,24 @@ class DebugDashboard:
                     "[dim]pending[/dim]",
                     "-",
                     "-",
+                    "-",
+                    "-",
                     f"{elapsed:.1f}s",
                 )
 
         self.console.print(table)
 
+        # Token/Cost Zusammenfassung
+        if total_tokens_in or total_tokens_out:
+            self.console.print(
+                f"\n[bold]Token-Verbrauch:[/bold] "
+                f"{total_tokens_in} input + {total_tokens_out} output = "
+                f"{total_tokens_in + total_tokens_out} total"
+                + (f" | [bold]Kosten: ${total_cost:.4f}[/bold]" if total_cost > 0 else "")
+            )
+
         # Zusammenfassung
-        self.console.print(f"\n[bold]{done_count}/{total} erfolgreich[/bold]", end="")
+        self.console.print(f"[bold]{done_count}/{total} erfolgreich[/bold]", end="")
         if failed_count:
             self.console.print(f", [red]{failed_count} fehlgeschlagen[/red]")
         else:

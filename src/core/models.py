@@ -171,6 +171,11 @@ class ScanResult(BaseModel):
     format_match_score: float = 0.0  # 0.0 - 1.0
     expected_vs_actual_length_ratio: float = 1.0
 
+    # Token-Usage (von LLMResult)
+    tokens_input: int = 0
+    tokens_output: int = 0
+    cost_estimated: float = 0.0
+
 
 class AnalysisResult(BaseModel):
     """Finale Analyse vom Hauptsystem."""

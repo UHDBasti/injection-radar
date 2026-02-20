@@ -247,6 +247,9 @@ class ScanResponse(BaseModel):
     flags: Optional[list[dict]] = None
     llm_provider: Optional[str] = None
     llm_model: Optional[str] = None
+    tokens_input: int = 0
+    tokens_output: int = 0
+    cost_estimated: float = 0.0
     processing_time_ms: Optional[int] = None
     scanned_at: Optional[datetime] = None
     error_message: Optional[str] = None
@@ -427,6 +430,9 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
             flags=result.flags,
             llm_provider=result.llm_provider,
             llm_model=result.llm_model,
+            tokens_input=result.tokens_input,
+            tokens_output=result.tokens_output,
+            cost_estimated=result.cost_estimated,
             processing_time_ms=result.processing_time_ms,
             scanned_at=datetime.now(timezone.utc),
         )
@@ -509,6 +515,9 @@ async def get_scan_status(job_id: str):
             flags=result.flags,
             llm_provider=result.llm_provider,
             llm_model=result.llm_model,
+            tokens_input=result.tokens_input,
+            tokens_output=result.tokens_output,
+            cost_estimated=result.cost_estimated,
             processing_time_ms=result.processing_time_ms,
             scanned_at=datetime.utcnow(),
             error_message=result.error_message,
