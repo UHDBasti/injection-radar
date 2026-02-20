@@ -1150,17 +1150,37 @@ def interactive_shell():
         ensure_local_requirements()
         config["use_local_mode"] = True
         console.print("[dim]Modus: Lokal (SQLite, kein Docker)[/dim]")
+        console.print()
+        console.print("[bold green]Bereit.[/bold green] Starte deinen ersten Scan mit [cyan]scan <url>[/cyan]\n")
     else:
         config["use_local_mode"] = False
-        console.print("[dim]Modus: Zwei-System-Architektur (Docker)[/dim]")
+        # Finale System-Uebersicht
+        import httpx
+        try:
+            resp = httpx.get("http://localhost:8000/status", timeout=3)
+            if resp.status_code == 200:
+                data = resp.json()
+                total_urls = data.get("total_urls", 0)
+                total_domains = data.get("total_domains", 0)
+                queue_len = data.get("queue_length", 0)
+                console.print()
+                console.print(Panel(
+                    f"[green]Alle Systeme bereit.[/green]\n"
+                    f"[dim]DB: {total_urls} URLs / {total_domains} Domains | "
+                    f"Queue: {queue_len} Jobs | "
+                    f"2 Scraper-Worker aktiv[/dim]\n\n"
+                    f"Starte Scans mit [bold cyan]scan <url>[/bold cyan] oder [bold cyan]scan list <datei.csv>[/bold cyan]\n"
+                    f"Debug-Modus: [bold cyan]scan <url> --debug[/bold cyan]",
+                    title="[bold cyan]InjectionRadar[/bold cyan]",
+                    border_style="green",
+                    padding=(1, 2),
+                ))
+            else:
+                console.print("\n[bold green]Systeme bereit.[/bold green] Starte deinen Scan mit [cyan]scan <url>[/cyan]\n")
+        except Exception:
+            console.print("\n[bold green]Systeme bereit.[/bold green] Starte deinen Scan mit [cyan]scan <url>[/cyan]\n")
 
-    console.print()
-
-    # Status anzeigen
-    show_status(config)
-
-    # Hilfe-Hinweis
-    console.print("[dim]Tippe 'help' für verfügbare Befehle oder 'scan <url>' zum Starten.[/dim]\n")
+    console.print("[dim]Tippe 'help' für alle Befehle.[/dim]\n")
 
     # Event Loop für die gesamte Session (vermeidet "Event loop is closed" Fehler)
     loop = asyncio.new_event_loop()

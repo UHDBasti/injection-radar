@@ -358,6 +358,20 @@ def auto_start_services(console: Console) -> Tuple[bool, bool]:
     all_running = all(status.values())
 
     if all_running:
+        # Quick health check im Hintergrund
+        try:
+            import httpx
+            response = httpx.get("http://localhost:8000/health", timeout=3)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get("status") == "healthy":
+                    console.print("[green]✓[/green] Alle Systeme operativ")
+                    return True, False
+                else:
+                    console.print("[yellow]![/yellow] Services laufen, aber Health-Check: " + data.get("status", "unknown"))
+                    return True, False
+        except Exception:
+            pass
         console.print("[green]✓[/green] Alle Services laufen bereits")
         return True, False
 
@@ -402,7 +416,7 @@ def auto_start_services(console: Console) -> Tuple[bool, bool]:
             console.print("[yellow]Orchestrator nicht bereit - nutze lokalen Modus[/yellow]")
             return False, True
 
-    console.print("[green]✓[/green] Alle Services bereit (Zwei-System-Architektur)")
+    console.print("[green]✓[/green] Alle Systeme hochgefahren und bereit")
     return True, False
 
 
