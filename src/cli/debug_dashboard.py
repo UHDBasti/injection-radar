@@ -141,6 +141,29 @@ class DebugDashboard:
         self.system_status = {"status": "unknown", "queue": 0, "workers": "?"}
         self._running = False
         self._log_process: Optional[subprocess.Popen] = None
+        self._live: Optional[Live] = None
+
+    def _cleanup(self):
+        """Synchronous cleanup for when KeyboardInterrupt is caught externally.
+
+        Called from interactive.py when loop.run_until_complete() raises
+        KeyboardInterrupt - the async finally block never runs in that case.
+        """
+        self._running = False
+        self._stop_log_tailing()
+        # Mark unfinished jobs
+        for tracker in self.jobs.values():
+            if tracker.state not in (JobState.DONE, JobState.FAILED):
+                tracker.fail("Abgebrochen (Ctrl+C)")
+        # Stop Rich Live if it was started
+        if hasattr(self, '_live') and self._live is not None:
+            try:
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+        # Show final results
+        self._show_final_results()
 
     async def run(self, urls: list[str]):
         """Hauptmethode: Jobs submitten, Dashboard anzeigen bis alle fertig."""
@@ -157,22 +180,21 @@ class DebugDashboard:
             return
 
         tasks = []
-        live = None
         try:
             # Live Dashboard starten
-            live = Live(
+            self._live = Live(
                 self._render(),
                 console=self.console,
                 refresh_per_second=2,
                 screen=False,
             )
-            live.start()
+            self._live.start()
 
             # Parallele Tasks: Polling + Log Tailing + System Status
             tasks = [
-                asyncio.create_task(self._poll_jobs(live)),
-                asyncio.create_task(self._tail_docker_logs(live)),
-                asyncio.create_task(self._poll_system(live)),
+                asyncio.create_task(self._poll_jobs(self._live)),
+                asyncio.create_task(self._tail_docker_logs(self._live)),
+                asyncio.create_task(self._poll_system(self._live)),
             ]
 
             # Warte bis alle Jobs fertig sind
@@ -183,7 +205,7 @@ class DebugDashboard:
                 )
                 if all_done:
                     # Noch kurz anzeigen
-                    live.update(self._render())
+                    self._live.update(self._render())
                     await asyncio.sleep(1)
                     # Terminal bell
                     print("\a", end="", flush=True)
@@ -206,11 +228,12 @@ class DebugDashboard:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             # 4. Stop Rich Live display
-            if live is not None:
+            if self._live is not None:
                 try:
-                    live.stop()
+                    self._live.stop()
                 except Exception:
                     pass
+            self._live = None
 
         # Endergebnis anzeigen
         self._show_final_results()

@@ -463,6 +463,10 @@ async def scan_url_async(request: ScanRequest):
         raise HTTPException(status_code=500, detail=f"Failed to queue scan: {str(e)}")
 
 
+# Track which job_ids have already been persisted to DB (avoid duplicates on poll)
+_persisted_jobs: set[str] = set()
+
+
 @app.get("/scan/{job_id}/status", response_model=JobStatusResponse)
 async def get_scan_status(job_id: str):
     """Prüft den Status eines laufenden Scans."""
@@ -480,9 +484,16 @@ async def get_scan_status(job_id: str):
 
     confidence = _calculate_confidence(result.severity_score, result.classification)
 
-    # Persist results when completed (BUG 3: async flow never saved)
-    if result.status == "completed":
+    # Persist results when completed - only once per job_id
+    if result.status == "completed" and job_id not in _persisted_jobs:
+        _persisted_jobs.add(job_id)
         await _save_scan_results(result.url, result, confidence)
+        # Limit set size to prevent memory leak
+        if len(_persisted_jobs) > 10000:
+            # Remove oldest entries (set is unordered, just trim)
+            excess = len(_persisted_jobs) - 5000
+            for _ in range(excess):
+                _persisted_jobs.pop()
 
     return JobStatusResponse(
         job_id=job_id,

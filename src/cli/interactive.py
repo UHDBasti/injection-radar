@@ -1493,6 +1493,7 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
     console.print(f"\n[bold]Starte parallelen Scan von {len(urls)} URLs[/bold]")
     console.print(f"[dim]Max. parallel: {max_concurrent} | Ctrl+C zum Abbrechen[/dim]\n")
 
+    tasks = []
     try:
         with Progress(
             TextColumn("[bold blue]{task.description}"),
@@ -1819,6 +1820,7 @@ def interactive_shell():
                                 try:
                                     loop.run_until_complete(dashboard.run(urls))
                                 except KeyboardInterrupt:
+                                    dashboard._cleanup()
                                     console.print("\n[yellow]Dashboard abgebrochen.[/yellow]")
                             else:
                                 loop.run_until_complete(
@@ -1855,6 +1857,7 @@ def interactive_shell():
                             try:
                                 loop.run_until_complete(dashboard.run(normalized_urls))
                             except KeyboardInterrupt:
+                                dashboard._cleanup()
                                 console.print("\n[yellow]Dashboard abgebrochen.[/yellow]")
                         elif len(normalized_urls) == 1:
                             # Einzelner Scan
