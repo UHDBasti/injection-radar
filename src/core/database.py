@@ -268,7 +268,7 @@ class CrawlCheckpointDB(Base):
     __tablename__ = "crawl_checkpoints"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    source = Column(String(50), nullable=False, index=True)
+    source = Column(String(255), nullable=False, unique=True, index=True)
 
     # Position
     last_processed_index = Column(Integer, nullable=False)
@@ -283,9 +283,7 @@ class CrawlCheckpointDB(Base):
     last_updated = Column(DateTime, default=datetime.utcnow, nullable=False)
     completed_at = Column(DateTime, nullable=True)
 
-    __table_args__ = (
-        Index("idx_checkpoints_source", "source"),
-    )
+    __table_args__ = ()
 
 
 # Database Connection Utilities

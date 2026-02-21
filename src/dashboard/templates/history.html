@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}History - InjectionRadar{% endblock %}
+{% block content %}
+<h2>Scan History</h2>
+
+{% if urls %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>URL</th>
+            <th>Status</th>
+            <th>Confidence</th>
+            <th>Scans</th>
+            <th>Last Scanned</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for u in urls %}
+        <tr>
+            <td class="url-cell" title="{{ u.url }}">{{ u.url }}</td>
+            <td><span class="badge badge-{{ u.status }}">{{ u.status }}</span></td>
+            <td>{% if u.confidence is not none %}{{ "%.0f"|format(u.confidence * 100) }}%{% else %}-{% endif %}</td>
+            <td>{{ u.scan_count }}</td>
+            <td>{{ u.last_scanned or "-" }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+
+<div class="pagination">
+    {% if page > 1 %}
+    <a href="/dashboard/history?page={{ page - 1 }}">&laquo; Prev</a>
+    {% endif %}
+    <span class="current">Page {{ page }}</span>
+    {% if has_next %}
+    <a href="/dashboard/history?page={{ page + 1 }}">Next &raquo;</a>
+    {% endif %}
+</div>
+{% else %}
+<p>No scan history yet. <a href="/dashboard/scan">Start scanning</a>.</p>
+{% endif %}
+{% endblock %}

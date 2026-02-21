@@ -1,0 +1,54 @@
+<article>
+    <header>
+        <span class="badge badge-{{ result.classification or 'pending' }}">{{ result.classification or "pending" }}</span>
+        &nbsp; {{ result.url }}
+    </header>
+
+    {% if result.status == "completed" %}
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-value">{{ "%.1f"|format(result.severity_score or 0) }}</div>
+            <div class="stat-label">Severity</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{ result.flags_count or 0 }}</div>
+            <div class="stat-label">Flags</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{ "%.0f"|format((result.confidence or 0) * 100) }}%</div>
+            <div class="stat-label">Confidence</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">{{ result.processing_time_ms or "-" }}</div>
+            <div class="stat-label">Time (ms)</div>
+        </div>
+    </div>
+
+    {% if result.flags %}
+    <h4>Flags Detected</h4>
+    <table>
+        <thead>
+            <tr><th>Type</th><th>Severity</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+            {% for flag in result.flags %}
+            <tr>
+                <td>{{ flag.get("type", "-") if flag is mapping else flag.type }}</td>
+                <td>{{ flag.get("severity", "-") if flag is mapping else flag.severity }}</td>
+                <td>{{ flag.get("description", "-") if flag is mapping else flag.description }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+
+    <footer>
+        <small>Provider: {{ result.llm_provider or "-" }} | Model: {{ result.llm_model or "-" }} | Tokens: {{ result.tokens_input or 0 }} in / {{ result.tokens_output or 0 }} out</small>
+    </footer>
+
+    {% elif result.status == "failed" %}
+    <p>Scan failed: {{ result.error_message or "Unknown error" }}</p>
+    {% elif result.status == "timeout" %}
+    <p>Scan timed out. The scraper might be overloaded.</p>
+    {% endif %}
+</article>

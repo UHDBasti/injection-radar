@@ -37,6 +37,7 @@ from ..core.database import (
 )
 from ..core.queue import JobQueue, QueueConfig, ScanJob, JobResult
 from ..core.logging import log_info, log_error, log_warning
+from ..scheduler.scheduler import ScanScheduler
 
 
 # Global state
@@ -45,6 +46,7 @@ engine = None
 SessionFactory = None
 job_queue: Optional[JobQueue] = None
 rate_limit_redis: Optional[aioredis.Redis] = None
+scan_scheduler: Optional[ScanScheduler] = None
 
 
 @asynccontextmanager
@@ -90,10 +92,18 @@ async def lifespan(app: FastAPI):
 
     log_info("orchestrator_started", redis=f"{settings.redis.host}:{settings.redis.port}")
 
+    # Scheduler starten (falls aktiviert)
+    global scan_scheduler
+    if settings.scheduler.enabled and job_queue:
+        scan_scheduler = ScanScheduler(settings, SessionFactory, job_queue)
+        await scan_scheduler.start()
+
     yield
 
     # Shutdown
     log_info("orchestrator_stopping")
+    if scan_scheduler:
+        await scan_scheduler.stop()
     if rate_limit_redis:
         await rate_limit_redis.aclose()
     if job_queue:
@@ -106,6 +116,10 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+
+# Dashboard
+from ..dashboard.routes import dashboard_router
+app.include_router(dashboard_router)
 
 # CORS Middleware
 app.add_middleware(
@@ -134,12 +148,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# Rate limit tiers: path prefix -> requests per minute
-_RATE_LIMITS: dict[str, int] = {
-    "/scan/async": 120,   # Lightweight queue operation, needs high limit for batch
-    "/scan": 30,          # Synchronous scan, heavier but still needs batch support
-}
-_DEFAULT_RATE_LIMIT = 60  # read-only endpoints
+def _build_rate_limits() -> dict[str, int]:
+    """Build rate limit tiers from settings."""
+    return {
+        "/scan/async": settings.rate_limit.scan_async_per_minute,
+        "/scan": settings.rate_limit.scan_per_minute,
+    }
 
 
 def _get_rate_limit(path: str) -> int:
@@ -148,13 +162,15 @@ def _get_rate_limit(path: str) -> int:
     Status polling endpoints (/scan/{id}/status) use the default
     (higher) limit so that polling doesn't get throttled.
     """
+    default_limit = settings.rate_limit.default_per_minute
     # Status polling should not be rate-limited as strictly as scan submission
     if "/status" in path:
-        return _DEFAULT_RATE_LIMIT
-    for prefix, limit in _RATE_LIMITS.items():
+        return default_limit
+    rate_limits = _build_rate_limits()
+    for prefix, limit in rate_limits.items():
         if path.rstrip("/") == prefix or path.startswith(prefix + "/"):
             return limit
-    return _DEFAULT_RATE_LIMIT
+    return default_limit
 
 
 def _get_client_ip(request: Request) -> str:
@@ -173,25 +189,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next) -> Response:
-        if rate_limit_redis is None:
+        if not settings.rate_limit.enabled or rate_limit_redis is None:
             return await call_next(request)
 
         client_ip = _get_client_ip(request)
         limit = _get_rate_limit(request.url.path)
-        window = 60  # seconds
+        window = settings.rate_limit.window_seconds
         now = time.time()
         key = f"rl:{client_ip}:{limit}"
 
         try:
+            # Step 1: Clean old entries and count current usage
             pipe = rate_limit_redis.pipeline()
-            # Remove entries older than the window
             pipe.zremrangebyscore(key, 0, now - window)
-            # Count remaining entries
             pipe.zcard(key)
-            # Add current request
-            pipe.zadd(key, {f"{now}:{uuid.uuid4().hex[:8]}": now})
-            # Expire the whole key after the window to avoid leaks
-            pipe.expire(key, window + 1)
             results = await pipe.execute()
             current_count = results[1]
         except Exception:
@@ -214,6 +225,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                     "X-RateLimit-Remaining": "0",
                 },
             )
+
+        # Step 2: Only record the request if within limit
+        try:
+            pipe = rate_limit_redis.pipeline()
+            pipe.zadd(key, {f"{now}:{uuid.uuid4().hex[:8]}": now})
+            pipe.expire(key, window + 1)
+            await pipe.execute()
+        except Exception:
+            pass  # Non-critical - request already allowed
 
         response = await call_next(request)
         response.headers["X-RateLimit-Limit"] = str(limit)
@@ -310,6 +330,54 @@ async def health_check():
         "status": "healthy" if queue_ok else "degraded",
         "redis_connected": queue_ok,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/rate-limit/status")
+async def rate_limit_status(request: Request):
+    """Shows current rate limit configuration and per-IP usage."""
+    rl_config = settings.rate_limit
+    client_ip = _get_client_ip(request)
+    window = rl_config.window_seconds
+
+    tiers = {
+        "/scan": rl_config.scan_per_minute,
+        "/scan/async": rl_config.scan_async_per_minute,
+        "default": rl_config.default_per_minute,
+    }
+
+    # Gather current usage from Redis for this client IP
+    usage: dict[str, dict] = {}
+    if rate_limit_redis and rl_config.enabled:
+        now = time.time()
+        for tier_name, limit in tiers.items():
+            key = f"rl:{client_ip}:{limit}"
+            try:
+                pipe = rate_limit_redis.pipeline()
+                pipe.zremrangebyscore(key, 0, now - window)
+                pipe.zcard(key)
+                results = await pipe.execute()
+                current = results[1]
+            except Exception:
+                current = 0
+            usage[tier_name] = {
+                "limit": limit,
+                "used": current,
+                "remaining": max(0, limit - current),
+            }
+    else:
+        for tier_name, limit in tiers.items():
+            usage[tier_name] = {
+                "limit": limit,
+                "used": 0,
+                "remaining": limit,
+            }
+
+    return {
+        "enabled": rl_config.enabled,
+        "window_seconds": window,
+        "client_ip": client_ip,
+        "tiers": usage,
     }
 
 
@@ -668,6 +736,33 @@ async def get_queue_stats():
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Queue error: {str(e)}")
+
+
+@app.get("/scheduler/status")
+async def scheduler_status():
+    """Returns current scheduler state and statistics."""
+    if scan_scheduler is None:
+        return {
+            "enabled": settings.scheduler.enabled,
+            "running": False,
+            "message": "Scheduler not initialized. Set scheduler.enabled=true in config.",
+        }
+    return scan_scheduler.get_status()
+
+
+@app.post("/scheduler/trigger")
+async def scheduler_trigger():
+    """Manually trigger a rescan check (regardless of schedule)."""
+    if scan_scheduler is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Scheduler not enabled. Set scheduler.enabled=true in config.",
+        )
+    submitted = await scan_scheduler.check_and_rescan()
+    return {
+        "status": "triggered",
+        "urls_submitted": submitted,
+    }
 
 
 @app.get("/history")

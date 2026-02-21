@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - InjectionRadar{% endblock %}
+{% block content %}
+<h2>Dashboard</h2>
+
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.total_urls }}</div>
+        <div class="stat-label">Total URLs Scanned</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.total_domains }}</div>
+        <div class="stat-label">Domains</div>
+    </div>
+    <div class="stat-card stat-danger">
+        <div class="stat-value">{{ stats.dangerous_count }}</div>
+        <div class="stat-label">Dangerous</div>
+    </div>
+    <div class="stat-card stat-warning">
+        <div class="stat-value">{{ stats.suspicious_count }}</div>
+        <div class="stat-label">Suspicious</div>
+    </div>
+    <div class="stat-card stat-safe">
+        <div class="stat-value">{{ stats.safe_count }}</div>
+        <div class="stat-label">Safe</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.queue_length }}</div>
+        <div class="stat-label">Queue Length</div>
+    </div>
+</div>
+
+{% if stats.last_scan %}
+<p><small>Last scan: {{ stats.last_scan }}</small></p>
+{% endif %}
+
+<h3>Recent Scans</h3>
+{% if recent_scans %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>URL</th>
+            <th>Status</th>
+            <th>Severity</th>
+            <th>Confidence</th>
+            <th>Scanned</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for scan in recent_scans %}
+        <tr>
+            <td class="url-cell" title="{{ scan.url }}">{{ scan.url }}</td>
+            <td><span class="badge badge-{{ scan.status }}">{{ scan.status }}</span></td>
+            <td>
+                {% if scan.severity is not none %}
+                <span class="severity-bar" style="width: {{ (scan.severity * 10)|int }}px; background: {% if scan.severity >= 7 %}var(--ir-danger){% elif scan.severity >= 4 %}var(--ir-warning){% else %}var(--ir-safe){% endif %};"></span>
+                {{ "%.1f"|format(scan.severity) }}
+                {% else %}-{% endif %}
+            </td>
+            <td>{% if scan.confidence is not none %}{{ "%.0f"|format(scan.confidence * 100) }}%{% else %}-{% endif %}</td>
+            <td>{{ scan.last_scanned or "-" }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+{% else %}
+<p>No scans yet. <a href="/dashboard/scan">Start scanning</a>.</p>
+{% endif %}
+
+<h3>System Health</h3>
+<div class="stats-grid">
+    <div class="stat-card">
+        <div class="stat-value" style="font-size:1.2rem;">{{ health.status|upper }}</div>
+        <div class="stat-label">System Status</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value" style="font-size:1.2rem;">{% if health.redis_connected %}Connected{% else %}Disconnected{% endif %}</div>
+        <div class="stat-label">Redis</div>
+    </div>
+</div>
+{% endblock %}

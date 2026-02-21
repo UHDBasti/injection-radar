@@ -76,20 +76,25 @@ def save_config(config: dict):
 
 
 # ============================================================================
-# Checkpoint System
+# Checkpoint System (file-based fallback + DB-backed via CheckpointManager)
 # ============================================================================
 
 def _checkpoint_key(file_path: str) -> str:
-    """Generates a stable checkpoint filename from a CSV file path."""
+    """Generates a stable checkpoint key from a CSV file path."""
     import hashlib
     name = Path(file_path).stem
     path_hash = hashlib.md5(str(Path(file_path).resolve()).encode()).hexdigest()[:8]
-    return f"{name}_{path_hash}.json"
+    return f"{name}_{path_hash}"
+
+
+def _checkpoint_file(file_path: str) -> Path:
+    """Returns the checkpoint JSON file path for a given CSV."""
+    return CHECKPOINT_DIR / f"{_checkpoint_key(file_path)}.json"
 
 
 def load_checkpoint(file_path: str) -> Optional[dict]:
     """Loads a checkpoint for the given CSV file, or None if not found."""
-    cp_file = CHECKPOINT_DIR / _checkpoint_key(file_path)
+    cp_file = _checkpoint_file(file_path)
     if not cp_file.exists():
         return None
     try:
@@ -103,7 +108,7 @@ def save_checkpoint(file_path: str, total_urls: list[str],
                     completed_urls: list[str], failed_urls: list[str]):
     """Saves scan progress to a checkpoint file."""
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    cp_file = CHECKPOINT_DIR / _checkpoint_key(file_path)
+    cp_file = _checkpoint_file(file_path)
     data = {
         "file_path": str(Path(file_path).resolve()),
         "total_urls": total_urls,
@@ -117,7 +122,7 @@ def save_checkpoint(file_path: str, total_urls: list[str],
 
 def delete_checkpoint(file_path: str):
     """Removes the checkpoint file for a completed batch."""
-    cp_file = CHECKPOINT_DIR / _checkpoint_key(file_path)
+    cp_file = _checkpoint_file(file_path)
     if cp_file.exists():
         cp_file.unlink()
 
@@ -136,6 +141,78 @@ def list_checkpoints() -> list[dict]:
         except Exception:
             continue
     return results
+
+
+def _get_checkpoint_manager():
+    """Returns a CheckpointManager connected to the DB, or None if unavailable."""
+    try:
+        from ..core.config import get_settings
+        from ..core.database import get_async_engine, get_async_session_factory
+        from ..core.checkpoint import CheckpointManager
+
+        settings = get_settings()
+        if settings.database.type != "postgresql":
+            return None
+        engine = get_async_engine(settings.database.url)
+        session_factory = get_async_session_factory(engine)
+        return CheckpointManager(session_factory)
+    except Exception:
+        return None
+
+
+async def save_checkpoint_db(file_path: str, completed_count: int,
+                             last_url: str, total: int):
+    """Saves checkpoint to DB if available, file-based otherwise."""
+    manager = _get_checkpoint_manager()
+    if manager:
+        source = _checkpoint_key(file_path)
+        await manager.save_checkpoint(source, completed_count - 1, last_url, total)
+
+
+async def load_checkpoint_db(file_path: str) -> Optional[dict]:
+    """Loads checkpoint from DB if available."""
+    manager = _get_checkpoint_manager()
+    if not manager:
+        return None
+    source = _checkpoint_key(file_path)
+    cp = await manager.load_checkpoint(source)
+    if cp is None:
+        return None
+    return {
+        "source": cp.source,
+        "processed_count": cp.processed_count,
+        "total_in_source": cp.total_in_source,
+        "last_processed_url": cp.last_processed_url,
+        "started_at": cp.started_at.isoformat() if cp.started_at else None,
+        "last_updated": cp.last_updated.isoformat() if cp.last_updated else None,
+    }
+
+
+async def clear_checkpoint_db(file_path: str):
+    """Clears checkpoint from DB if available."""
+    manager = _get_checkpoint_manager()
+    if manager:
+        source = _checkpoint_key(file_path)
+        await manager.clear_checkpoint(source)
+
+
+async def list_checkpoints_db() -> list[dict]:
+    """Lists all open checkpoints from DB."""
+    manager = _get_checkpoint_manager()
+    if not manager:
+        return []
+    checkpoints = await manager.list_checkpoints()
+    return [
+        {
+            "source": cp.source,
+            "processed_count": cp.processed_count,
+            "total_in_source": cp.total_in_source,
+            "last_processed_url": cp.last_processed_url,
+            "started_at": cp.started_at.isoformat() if cp.started_at else None,
+            "last_updated": cp.last_updated.isoformat() if cp.last_updated else None,
+        }
+        for cp in checkpoints
+    ]
 
 
 def setup_wizard() -> dict:
@@ -320,6 +397,7 @@ def show_help():
 | `scan <url> --local` | Lokaler Scan ohne Docker |
 | `scan <url> --quick` | Schneller Scan ohne LLM |
 | `scan <url> --debug` | Scan mit Live Debug Dashboard |
+| `checkpoints` | Zeigt alle offenen Checkpoints (Datei + Datenbank) |
 | `resume` | Zeigt offene Checkpoints und setzt Batch-Scan fort |
 | `debug on` / `debug off` | Debug-Modus ein/ausschalten |
 | `results` | Zeigt Scan-Ergebnisse und Statistiken |
@@ -330,6 +408,8 @@ def show_help():
 | `db urls [safe/dangerous/N]` | Zeigt gescannte URLs |
 | `db export` | Exportiert Daten für ML-Training (JSONL+CSV) |
 | `status` | Zeigt den aktuellen Status |
+| `scheduler` | Zeigt Scheduler-Status (automatische Re-Scans) |
+| `scheduler trigger` | Manueller Re-Scan-Check |
 | `services` | Zeigt Docker-Service-Status |
 | `restart` | Startet alle Services neu |
 | `config` | Öffnet den Konfigurations-Wizard |
@@ -888,6 +968,85 @@ async def show_history(config: dict, limit: int = 20):
         log_error_with_trace("history_error", e)
         console.print(f"[red]Fehler beim Laden der History: {e}[/red]")
         console.print("[dim]Ist die Datenbank erreichbar?[/dim]")
+
+
+async def show_scheduler_status():
+    """Shows the current scheduler status via the API."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get("http://localhost:8000/scheduler/status")
+            data = resp.json()
+
+        table = Table(title="Scheduler Status", show_header=False, box=None)
+        table.add_column("Key", style="bold")
+        table.add_column("Value")
+
+        enabled = data.get("enabled", False)
+        running = data.get("running", False)
+        table.add_row("Enabled", "[green]Yes[/green]" if enabled else "[dim]No[/dim]")
+        table.add_row("Running", "[green]Yes[/green]" if running else "[dim]No[/dim]")
+
+        if data.get("message"):
+            table.add_row("Info", f"[yellow]{data['message']}[/yellow]")
+
+        if "check_interval_minutes" in data:
+            table.add_row("Check Interval", f"{data['check_interval_minutes']} min")
+        if "max_rescans_per_run" in data:
+            table.add_row("Max Rescans/Run", str(data["max_rescans_per_run"]))
+        if data.get("next_run"):
+            table.add_row("Next Run", data["next_run"])
+        if data.get("last_run"):
+            table.add_row("Last Run", data["last_run"])
+            table.add_row("Last Run Rescanned", str(data.get("last_run_rescanned", 0)))
+        table.add_row("Total Rescans", str(data.get("total_rescans", 0)))
+
+        intervals = data.get("rescan_intervals", {})
+        if intervals:
+            table.add_row(
+                "Rescan Intervals",
+                f"safe={intervals.get('safe_days', '?')}d, "
+                f"suspicious={intervals.get('suspicious_days', '?')}d, "
+                f"dangerous={intervals.get('dangerous_days', '?')}d",
+            )
+
+        console.print(table)
+        console.print()
+
+    except httpx.ConnectError:
+        console.print("[yellow]Orchestrator nicht erreichbar (localhost:8000)[/yellow]")
+        console.print("[dim]Starte die Services mit: restart[/dim]")
+    except Exception as e:
+        console.print(f"[red]Fehler: {e}[/red]")
+
+
+async def trigger_scheduler():
+    """Manually triggers a rescan check via the API."""
+    import httpx
+
+    try:
+        console.print("[dim]Triggering rescan check...[/dim]")
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post("http://localhost:8000/scheduler/trigger")
+
+        if resp.status_code == 503:
+            console.print("[yellow]Scheduler ist nicht aktiviert.[/yellow]")
+            console.print("[dim]Setze scheduler.enabled=true in config/config.yaml[/dim]")
+            return
+
+        data = resp.json()
+        submitted = data.get("urls_submitted", 0)
+        if submitted > 0:
+            console.print(f"[green]{submitted} URLs zum Re-Scan eingereicht[/green]")
+        else:
+            console.print("[dim]Keine URLs fuer Re-Scan faellig.[/dim]")
+
+    except httpx.ConnectError:
+        console.print("[yellow]Orchestrator nicht erreichbar (localhost:8000)[/yellow]")
+        console.print("[dim]Starte die Services mit: restart[/dim]")
+    except Exception as e:
+        console.print(f"[red]Fehler: {e}[/red]")
 
 
 async def show_results_overview(config: dict):
@@ -1810,8 +1969,19 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
                     completed_urls.append(url)
                 else:
                     failed_urls.append(url)
+                # File-based checkpoint (every URL)
                 save_checkpoint(checkpoint_file, full_url_list,
                                 completed_urls, failed_urls)
+                # DB-based checkpoint (every 5 URLs for efficiency)
+                total_done = len(completed_urls) + len(failed_urls)
+                if total_done % 5 == 0 or total_done == len(full_url_list):
+                    try:
+                        await save_checkpoint_db(
+                            checkpoint_file, total_done,
+                            url, len(full_url_list),
+                        )
+                    except Exception:
+                        pass  # DB save is best-effort
 
             progress.update(task_id, advance=1)
             return result
@@ -1879,7 +2049,16 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
         if checkpoint_file:
             save_checkpoint(checkpoint_file, full_url_list,
                             completed_urls, failed_urls)
-            remaining = len(full_url_list) - len(completed_urls) - len(failed_urls)
+            total_done = len(completed_urls) + len(failed_urls)
+            try:
+                await save_checkpoint_db(
+                    checkpoint_file, total_done,
+                    completed_urls[-1] if completed_urls else "",
+                    len(full_url_list),
+                )
+            except Exception:
+                pass
+            remaining = len(full_url_list) - total_done
             console.print(f"\n[yellow]Scan abgebrochen.[/yellow]")
             console.print(f"[dim]Checkpoint gespeichert: {len(completed_urls)} fertig, {remaining} verbleiben[/dim]")
             console.print(f"[dim]Fortsetzen mit: resume[/dim]")
@@ -1947,6 +2126,10 @@ async def do_scan_multiple(urls: list[str], config: dict, max_concurrent: int = 
         remaining = set(full_url_list) - set(completed_urls) - set(failed_urls)
         if not remaining:
             delete_checkpoint(checkpoint_file)
+            try:
+                await clear_checkpoint_db(checkpoint_file)
+            except Exception:
+                pass
             log_info("checkpoint_removed", file=checkpoint_file)
         else:
             console.print(f"\n[dim]Checkpoint gespeichert: {len(remaining)} URLs verbleiben[/dim]")
@@ -2254,6 +2437,14 @@ def interactive_shell():
                     else:
                         console.print("[dim]Befehle: db | db export | db urls [safe|dangerous|N][/dim]")
 
+                elif command == "scheduler":
+                    if not args or args[0] == "status":
+                        loop.run_until_complete(show_scheduler_status())
+                    elif args[0] == "trigger":
+                        loop.run_until_complete(trigger_scheduler())
+                    else:
+                        console.print("[dim]Befehle: scheduler | scheduler status | scheduler trigger[/dim]")
+
                 elif command == "services":
                     show_services_status()
 
@@ -2267,6 +2458,51 @@ def interactive_shell():
                         config["use_local_mode"] = use_local
                     else:
                         console.print("[yellow]Docker nicht verfügbar[/yellow]")
+
+                elif command == "checkpoints":
+                    # Show file-based checkpoints
+                    file_cps = list_checkpoints()
+                    # Show DB-based checkpoints
+                    db_cps = loop.run_until_complete(list_checkpoints_db())
+
+                    if not file_cps and not db_cps:
+                        console.print("[dim]Keine offenen Checkpoints vorhanden.[/dim]")
+                        continue
+
+                    if file_cps:
+                        console.print(f"\n[bold]Datei-basierte Checkpoints ({len(file_cps)}):[/bold]\n")
+                        table = Table(show_header=True, header_style="bold")
+                        table.add_column("#", width=4)
+                        table.add_column("Datei", max_width=30)
+                        table.add_column("Fortschritt", width=20)
+                        table.add_column("Gespeichert", width=18)
+                        for i, cp in enumerate(file_cps, 1):
+                            total = len(cp.get("total_urls", []))
+                            done = len(cp.get("completed_urls", []))
+                            failed = len(cp.get("failed_urls", []))
+                            remaining = total - done - failed
+                            fp = Path(cp.get("file_path", "?")).name
+                            ts = cp.get("timestamp", "?")[:16]
+                            table.add_row(str(i), fp, f"{done}/{total} ({remaining} offen)", ts)
+                        console.print(table)
+
+                    if db_cps:
+                        console.print(f"\n[bold]Datenbank-Checkpoints ({len(db_cps)}):[/bold]\n")
+                        table = Table(show_header=True, header_style="bold")
+                        table.add_column("#", width=4)
+                        table.add_column("Quelle", max_width=30)
+                        table.add_column("Fortschritt", width=20)
+                        table.add_column("Aktualisiert", width=18)
+                        for i, cp in enumerate(db_cps, 1):
+                            total = cp.get("total_in_source", 0)
+                            done = cp.get("processed_count", 0)
+                            remaining = total - done
+                            src = cp.get("source", "?")
+                            ts = (cp.get("last_updated") or "?")[:16]
+                            table.add_row(str(i), src, f"{done}/{total} ({remaining} offen)", ts)
+                        console.print(table)
+
+                    console.print("\n[dim]Verwende 'resume' um einen Checkpoint fortzusetzen.[/dim]")
 
                 elif command == "resume":
                     checkpoints = list_checkpoints()

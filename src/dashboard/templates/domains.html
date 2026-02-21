@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Domains - InjectionRadar{% endblock %}
+{% block content %}
+<h2>Domain Risk Overview</h2>
+
+{% if domains %}
+<figure>
+<table>
+    <thead>
+        <tr>
+            <th>Domain</th>
+            <th>Risk Score</th>
+            <th>Dangerous</th>
+            <th>Suspicious</th>
+            <th>Total Scanned</th>
+            <th>First Seen</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for d in domains %}
+        <tr>
+            <td>{{ d.domain }}</td>
+            <td>
+                <span class="severity-bar" style="width: {{ (d.risk_score * 10)|int }}px; background: {% if d.risk_score >= 7 %}var(--ir-danger){% elif d.risk_score >= 3 %}var(--ir-warning){% else %}var(--ir-safe){% endif %};"></span>
+                {{ "%.1f"|format(d.risk_score) }}
+            </td>
+            <td>{% if d.dangerous_count > 0 %}<span class="badge badge-dangerous">{{ d.dangerous_count }}</span>{% else %}0{% endif %}</td>
+            <td>{% if d.suspicious_count > 0 %}<span class="badge badge-suspicious">{{ d.suspicious_count }}</span>{% else %}0{% endif %}</td>
+            <td>{{ d.total_scanned }}</td>
+            <td>{{ d.first_seen }}</td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+</figure>
+{% else %}
+<p>No domains scanned yet. <a href="/dashboard/scan">Start scanning</a>.</p>
+{% endif %}
+{% endblock %}

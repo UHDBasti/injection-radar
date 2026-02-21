@@ -128,6 +128,32 @@ api:
     - "http://localhost:8080"
 
 # =============================================================================
+# Rate Limiting
+# =============================================================================
+rate_limit:
+  enabled: true
+  default_per_minute: 60    # Read-only endpoints
+  scan_per_minute: 30       # Synchronous scan (POST /scan)
+  scan_async_per_minute: 120  # Async scan (POST /scan/async)
+  window_seconds: 60        # Sliding window size
+
+# =============================================================================
+# Scheduled Scans
+# =============================================================================
+scheduler:
+  enabled: false              # Set to true to enable automatic re-scanning
+  check_interval_minutes: 60  # How often to check for due URLs
+  max_rescans_per_run: 20     # Max URLs to re-scan per check cycle
+
+# =============================================================================
+# MCP Server
+# =============================================================================
+mcp:
+  api_url: "http://localhost:8000"   # Orchestrator API URL
+  timeout_seconds: 180               # Request timeout for scan operations
+  max_retries: 3                     # Retry count on connection/timeout errors
+
+# =============================================================================
 # Logging
 # =============================================================================
 logging:

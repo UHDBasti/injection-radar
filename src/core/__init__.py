@@ -16,6 +16,7 @@ from .models import (
     Classification,
     Severity,
 )
+from .checkpoint import CheckpointManager
 from .config import Settings, get_settings
 from .database import (
     Base,
@@ -47,6 +48,8 @@ __all__ = [
     "RedFlagType",
     "Classification",
     "Severity",
+    # Checkpoint
+    "CheckpointManager",
     # Config
     "Settings",
     "get_settings",

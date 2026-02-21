@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}InjectionRadar{% endblock %}</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <style>
+        :root {
+            --ir-danger: #e53e3e;
+            --ir-warning: #dd6b20;
+            --ir-safe: #38a169;
+            --ir-pending: #718096;
+            --ir-error: #e53e3e;
+        }
+        nav .brand { font-weight: 700; font-size: 1.2rem; }
+        .badge {
+            display: inline-block;
+            padding: 0.15rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .badge-dangerous { background: var(--ir-danger); color: #fff; }
+        .badge-suspicious { background: var(--ir-warning); color: #fff; }
+        .badge-safe { background: var(--ir-safe); color: #fff; }
+        .badge-pending { background: var(--ir-pending); color: #fff; }
+        .badge-error { background: var(--ir-error); color: #fff; }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+        .stat-card {
+            padding: 1rem;
+            border-radius: 8px;
+            background: var(--pico-card-background-color);
+            border: 1px solid var(--pico-muted-border-color);
+            text-align: center;
+        }
+        .stat-card .stat-value {
+            font-size: 2rem;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+        .stat-card .stat-label {
+            font-size: 0.85rem;
+            color: var(--pico-muted-color);
+        }
+        .stat-danger .stat-value { color: var(--ir-danger); }
+        .stat-warning .stat-value { color: var(--ir-warning); }
+        .stat-safe .stat-value { color: var(--ir-safe); }
+
+        table { font-size: 0.9rem; }
+        .url-cell { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+        .htmx-indicator { display: none; }
+        .htmx-request .htmx-indicator { display: inline-block; }
+        .htmx-request.htmx-indicator { display: inline-block; }
+
+        .severity-bar {
+            display: inline-block;
+            height: 8px;
+            border-radius: 4px;
+            min-width: 20px;
+        }
+        .pagination { display: flex; gap: 0.5rem; justify-content: center; margin-top: 1rem; }
+        .pagination a, .pagination span {
+            padding: 0.3rem 0.7rem;
+            border-radius: 4px;
+            text-decoration: none;
+            font-size: 0.85rem;
+        }
+        .pagination .current {
+            background: var(--pico-primary);
+            color: #fff;
+        }
+    </style>
+</head>
+<body>
+    <nav class="container">
+        <ul>
+            <li><a href="/dashboard" class="brand">InjectionRadar</a></li>
+        </ul>
+        <ul>
+            <li><a href="/dashboard">Dashboard</a></li>
+            <li><a href="/dashboard/scan">Scan</a></li>
+            <li><a href="/dashboard/history">History</a></li>
+            <li><a href="/dashboard/domains">Domains</a></li>
+        </ul>
+    </nav>
+    <main class="container">
+        {% block content %}{% endblock %}
+    </main>
+    <footer class="container">
+        <small>InjectionRadar &mdash; Prompt Injection Detection System</small>
+    </footer>
+</body>
+</html>

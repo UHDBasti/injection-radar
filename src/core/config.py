@@ -97,6 +97,26 @@ class CrawlingConfig(BaseSettings):
     checkpoint_interval: int = 50
 
 
+class RateLimitConfig(BaseSettings):
+    """Rate Limiting Konfiguration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = True
+    default_per_minute: int = 60
+    scan_per_minute: int = 30
+    scan_async_per_minute: int = 120
+    window_seconds: int = 60
+
+
+class SchedulerConfig(BaseSettings):
+    """Scheduler-Konfiguration für automatische Re-Scans."""
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = False  # Disabled by default
+    check_interval_minutes: int = 60
+    max_rescans_per_run: int = 20
+
+
 class APIConfig(BaseSettings):
     """API-Konfiguration."""
     model_config = SettingsConfigDict(extra="ignore")
@@ -104,6 +124,15 @@ class APIConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     rate_limit_per_minute: int = 60
+
+
+class MCPConfig(BaseSettings):
+    """MCP Server Konfiguration."""
+    model_config = SettingsConfigDict(extra="ignore")
+
+    api_url: str = "http://localhost:8000"
+    timeout_seconds: int = 180
+    max_retries: int = 3
 
 
 class RedisConfig(BaseSettings):
@@ -162,6 +191,9 @@ class Settings(BaseSettings):
     crawling: CrawlingConfig = Field(default_factory=CrawlingConfig)
     api: APIConfig = Field(default_factory=APIConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
+    rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)
 
     # Logging
     log_level: str = "INFO"

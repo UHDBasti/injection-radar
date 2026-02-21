@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/__init__.py ./src/
 COPY src/api/ ./src/api/
 COPY src/core/ ./src/core/
+COPY src/dashboard/ ./src/dashboard/
+COPY src/scheduler/ ./src/scheduler/
 # Config wird NICHT kopiert - stattdessen Umgebungsvariablen verwenden
 
 # Create non-root user
