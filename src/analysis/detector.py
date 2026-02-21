@@ -72,6 +72,7 @@ class RedFlagDetector:
 
     # a) Direkte Injection-Anweisungen im Website-Content
     CONTENT_INJECTION_PATTERNS = [
+        # --- English ---
         r"ignore\s+(all\s+)?(the\s+)?(previous\s+|prior\s+|above\s+)?instructions",
         r"disregard\s+(all\s+)?(the\s+)?(previous\s+|prior\s+|above\s+)?instructions",
         r"forget\s+(all\s+)?(the\s+)?(previous\s+|prior\s+|above\s+)?(instructions|context|everything)",
@@ -90,6 +91,66 @@ class RedFlagDetector:
         r"an?\s+(?:unrestricted|unfiltered)\s+(?:AI|bot|assistant|model)",
         r"does?\s+the\s+jobs?\s+as\s+the\s+assistant",
         r"(?:find|get|obtain|extract)\s+(?:out\s+)?(?:the\s+)?user'?s?\s+(?:real\s+)?(?:name|email|password|data|information)",
+        # --- Deutsch ---
+        r"ignorier(?:e|en?)\s+(alle\s+)?(?:vorherigen?\s+|bisherigen?\s+|obigen?\s+)?(?:Anweisungen|Instruktionen|Befehle)",
+        r"vergiss\s+(alle\s+)?(?:vorherigen?\s+|bisherigen?\s+)?(?:Anweisungen|Instruktionen|Befehle|alles)",
+        r"(?:befolge|beachte)\s+(die\s+)?(?:vorherigen?\s+|bisherigen?\s+)?(?:Anweisungen|Instruktionen)\s+nicht",
+        r"(?:überschreib|ersetze)\s+(alle\s+)?(?:vorherigen?\s+)?(?:Anweisungen|Instruktionen)",
+        r"du\s+bist\s+(?:jetzt|nun|ab\s+sofort)\s+(ein|eine|der|die)\b",
+        r"deine\s+neue\s+(Rolle|Aufgabe|Anweisung|Instruktion)\s+(ist|lautet)",
+        r"neue\s+(?:Anweisungen?|Instruktionen?)\s*:",
+        r"ab\s+(?:jetzt|sofort)\s+(?:bist|sollst|musst|wirst)\s+du",
+        r"fasse?\s+(?:nicht\s+)?zusammen",
+        r"du\s+(?:musst|sollst)\s+(?:jetzt|nun|stattdessen|ab\s+sofort)",
+        r"(?:ein|eine)\s+(?:uneingeschränkte[rs]?|unzensierte[rs]?)\s+(?:KI|Bot|Assistent|Modell)",
+        # --- Français ---
+        r"ignor(?:e|ez|er)\s+(toutes?\s+)?(?:les?\s+)?(?:instructions?\s+|consignes?\s+)?(?:précédentes?|antérieures?|ci-dessus)",
+        r"oubli(?:e|ez|er)\s+(toutes?\s+)?(?:les?\s+)?(?:instructions?\s+)?(?:précédentes?|antérieures?)",
+        r"(?:ne\s+)?sui(?:s|vez)\s+(?:pas\s+)?(?:les?\s+)?instructions?\s+précédentes?",
+        r"tu\s+es\s+(?:maintenant|désormais)\s+(un|une|le|la)\b",
+        r"(?:ta|votre)\s+nouvelle\s+(?:mission|rôle|tâche|instruction)\s+(?:est|consiste)",
+        r"nouvelles?\s+instructions?\s*:",
+        r"à\s+partir\s+de\s+maintenant",
+        # --- Español ---
+        r"ignora\s+(todas?\s+)?(?:las?\s+)?(?:instrucciones?\s+)?(?:anteriores?|previas?)",
+        r"olvida\s+(todas?\s+)?(?:las?\s+)?(?:instrucciones?\s+)?(?:anteriores?|previas?|todo)",
+        r"no\s+(?:sigas?|cumplas?)\s+(?:las?\s+)?instrucciones?\s+(?:anteriores?|previas?)",
+        r"(?:ahora\s+)?eres\s+(?:un|una|el|la)\b",
+        r"tu\s+nuev[oa]\s+(?:rol|tarea|instrucción|objetivo)\s+(?:es|será)",
+        r"nuevas?\s+instrucciones?\s*:",
+        r"a\s+partir\s+de\s+ahora",
+        # --- Português ---
+        r"ignor(?:e|ar)\s+(todas?\s+)?(?:as?\s+)?(?:instruções?\s+)?(?:anteriores?|prévias?)",
+        r"esqueç(?:a|er)\s+(todas?\s+)?(?:as?\s+)?(?:instruções?\s+)?(?:anteriores?|prévias?|tudo)",
+        r"(?:agora\s+)?você\s+é\s+(?:um|uma|o|a)\b",
+        r"(?:sua|tua)\s+nov[oa]\s+(?:função|tarefa|instrução)\s+(?:é|será)",
+        # --- Italiano ---
+        r"ignora\s+(tutte?\s+)?(?:le?\s+)?(?:istruzioni?\s+)?(?:precedenti?|anteriori?)",
+        r"dimentica\s+(tutte?\s+)?(?:le?\s+)?(?:istruzioni?\s+)?(?:precedenti?|anteriori?|tutto)",
+        r"(?:ora\s+)?(?:sei|sarai)\s+(?:un|una|il|la)\b.*?(?:assistente|modello|bot)",
+        r"nuov[ae]\s+istruzioni?\s*:",
+        # --- Russisch (transliteriert + kyrillisch) ---
+        r"игнорируй\s+(?:все\s+)?(?:предыдущие\s+)?(?:инструкции|указания|команды)",
+        r"забудь\s+(?:все\s+)?(?:предыдущие\s+)?(?:инструкции|указания|команды|всё)",
+        r"ты\s+(?:теперь|сейчас)\s+",
+        r"новые\s+(?:инструкции|указания|команды)\s*:",
+        # --- Chinesisch ---
+        r"忽略\s*(?:所有\s*)?(?:之前|先前|以上)\s*(?:的\s*)?(?:指令|指示|说明)",
+        r"忘记\s*(?:所有\s*)?(?:之前|先前)\s*(?:的\s*)?(?:指令|指示|说明|一切)",
+        r"你现在是",
+        r"新的?(?:指令|指示|说明|角色|任务)\s*[：:]",
+        # --- Japanisch ---
+        r"(?:以前|前|これまで)の(?:指示|命令|指令)を(?:無視|忘れ|忘却)",
+        r"(?:今から|これから)(?:あなた|お前)は",
+        r"新しい(?:指示|命令|指令|役割)\s*[：:]",
+        # --- Koreanisch ---
+        r"(?:이전|이전의|위의)\s*(?:지시|명령|지침)을?\s*(?:무시|잊어)",
+        r"(?:지금부터|이제부터)\s*(?:너는|당신은)",
+        r"새로운\s*(?:지시|명령|지침|역할)\s*[：:]",
+        # --- Arabisch ---
+        r"تجاهل\s+(?:جميع\s+)?(?:التعليمات|الأوامر|الإرشادات)\s+(?:السابقة|أعلاه)",
+        r"أنت\s+الآن\s+",
+        r"تعليمات\s+جديدة\s*[：:]",
     ]
 
     # b) Fake System/Role Tags
@@ -137,6 +198,7 @@ class RedFlagDetector:
 
     # d) Jailbreak Patterns
     JAILBREAK_PATTERNS = [
+        # --- English ---
         r"\bDAN\b(?:\s+mode)?",
         r"Do\s+Anything\s+Now",
         r"Now[- ]?Do[- ]?Anything",
@@ -158,6 +220,50 @@ class RedFlagDetector:
         r"not\s+restricted\s+by\s+(the\s+)?rules",
         r"is\s+in\s+error\s+and\s+offline",
         r"secret\s+agend[as]?",
+        # --- Deutsch ---
+        r"keine\s+(?:Einschränkungen|Beschränkungen|Grenzen|Limitierungen)",
+        r"\buneingeschränkt\b",
+        r"Entwicklermodus",
+        r"Wartungsmodus",
+        r"Gott[- ]?Modus",
+        r"ohne\s+(?:jegliche\s+)?(?:Einschränkungen|Beschränkungen|Grenzen|Limits|Regeln)",
+        r"ohne\s+(?:ethische\s+|sicherheits\s*)?(?:Richtlinien|Filter|Vorgaben)",
+        r"(?:umgehe?|umgehen|überspring)\s+(?:die\s+)?(?:Sicherheits|Inhalts)[- ]?(?:filter|richtlinien|regeln)",
+        r"nicht\s+(?:durch\s+)?(?:die\s+)?Regeln\s+(?:eingeschränkt|beschränkt|begrenzt)",
+        r"tu(?:e|st)?\s+(?:jetzt\s+)?alles\s+was\s+ich\s+(?:sage|will|verlange)",
+        r"geheime[rs]?\s+(?:Agenda|Auftrag|Mission|Ziel)",
+        r"(?:gib|tu)\s+(?:so\s+)?(?:als\s+ob|vor)\s+du\s+(?:wärst|bist)",
+        # --- Français ---
+        r"(?:aucune|sans)\s+(?:restriction|limitation|contrainte)s?",
+        r"\bsans\s+(?:filtre|limite)s?\b",
+        r"mode\s+(?:développeur|maintenance|dieu|urgence)",
+        r"(?:fais|faites)\s+(?:semblant|comme\s+si)\s+(?:tu\s+es|vous\s+êtes)",
+        r"(?:contourne|ignore)[rz]?\s+(?:les?\s+)?(?:filtres?|restrictions?|règles?)\s+(?:de\s+)?(?:sécurité|contenu|éthique)",
+        r"agenda\s+secr[eè]te?",
+        # --- Español ---
+        r"(?:sin|ninguna)\s+(?:restriccion|limitación|restricciones|limitaciones)",
+        r"modo\s+(?:desarrollador|mantenimiento|dios|emergencia)",
+        r"(?:finge|simula|actúa\s+como\s+si)\s+(?:eres|fueras)\b",
+        r"(?:evita|elude|salta)\s+(?:los?\s+)?(?:filtros?|restricciones?|reglas?)\s+(?:de\s+)?(?:seguridad|contenido)",
+        r"agenda\s+secreta",
+        # --- Russisch ---
+        r"(?:без|никаких)\s+(?:ограничений|лимитов|рамок)",
+        r"режим\s+(?:разработчика|бога|обслуживания)",
+        r"(?:притворись|представь)\s+(?:что\s+)?(?:ты|вы)",
+        r"(?:обойди|игнорируй)\s+(?:все\s+)?(?:фильтры|ограничения|правила)",
+        # --- Chinesisch ---
+        r"(?:没有|无|不受)\s*(?:限制|约束|规则)",
+        r"(?:开发者|维护|上帝|紧急)\s*模式",
+        r"(?:假装|扮演|充当)\s*(?:你是|你现在是)",
+        r"(?:绕过|忽略|跳过)\s*(?:安全|内容)?\s*(?:过滤|限制|规则)",
+        # --- Japanisch ---
+        r"(?:制限|制約)\s*(?:なし|なく|のない)",
+        r"(?:開発者|メンテナンス|ゴッド)\s*モード",
+        r"(?:のふりをして|になりきって|を演じて)",
+        # --- Koreanisch ---
+        r"(?:제한|제약)\s*(?:없이|없는|없음)",
+        r"(?:개발자|유지보수|신)\s*모드",
+        r"(?:인척|처럼)\s*(?:행동|연기)",
     ]
 
     # e) Hidden text CSS patterns (für raw HTML)
