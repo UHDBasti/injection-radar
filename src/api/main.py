@@ -506,7 +506,8 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
             cost_estimated=result.cost_estimated,
             processing_time_ms=result.processing_time_ms,
             scanned_at=datetime.now(timezone.utc),
-            reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, lang=request.lang),
+            error_message=result.error_message,
+            reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, lang=request.lang, error_message=result.error_message),
             llm_summary=result.llm_summary,
         )
 
@@ -594,7 +595,7 @@ async def get_scan_status(job_id: str):
             processing_time_ms=result.processing_time_ms,
             scanned_at=datetime.utcnow(),
             error_message=result.error_message,
-            reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, lang="de"),
+            reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, lang="de", error_message=result.error_message),
             llm_summary=result.llm_summary,
         ),
     )
@@ -870,8 +871,17 @@ async def get_dangerous_domains(
 # Helper Functions
 # ============================================================================
 
-def _generate_reasoning(classification: str, severity_score: float, flags: list[dict], lang: str = "de") -> str:
+def _generate_reasoning(classification: str, severity_score: float, flags: list[dict], lang: str = "de", error_message: str = None) -> str:
     """Generates a human-readable summary of the scan result."""
+    if classification == "error":
+        if error_message:
+            if lang == "en":
+                return f"The scan could not be fully completed: {error_message}. No LLM analysis was performed."
+            return f"Der Scan konnte nicht vollständig durchgeführt werden: {error_message}. Es wurde keine LLM-Analyse durchgeführt."
+        if lang == "en":
+            return "The scan could not be completed. No LLM analysis was performed."
+        return "Der Scan konnte nicht abgeschlossen werden. Es wurde keine LLM-Analyse durchgeführt."
+
     if classification == "safe":
         if lang == "en":
             return "No suspicious patterns detected. The website content was processed normally by the test LLM."
@@ -1040,7 +1050,7 @@ async def _save_scan_results(url_str: str, result: JobResult, confidence: float)
                 confidence=confidence,
                 severity_score=result.severity_score,
                 flags_triggered=result.flags,
-                reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags),
+                reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, error_message=result.error_message),
                 analyzed_at=datetime.utcnow(),
             )
             session.add(analysis_db)
