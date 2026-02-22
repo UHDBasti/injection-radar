@@ -126,26 +126,30 @@ class ScraperWorker:
             ScrapedContent mit allen extrahierten Daten.
         """
         # Tier 1: Playwright
-        content = await self._scrape_with_playwright(url)
+        content = None
+        try:
+            content = await self._scrape_with_playwright(url)
 
-        # Prüfen ob Playwright echten Content geliefert hat
-        if content.http_status < 400:
-            is_blocked, block_reason = is_bot_protection_page(
-                content.extracted_text, content.word_count
-            )
-            if not is_blocked:
-                return content
-            log_warning(
-                "playwright_bot_detected",
-                url=url,
-                reason=block_reason,
-            )
-        else:
-            log_warning(
-                "playwright_http_error",
-                url=url,
-                http_status=content.http_status,
-            )
+            # Prüfen ob Playwright echten Content geliefert hat
+            if content.http_status < 400:
+                is_blocked, block_reason = is_bot_protection_page(
+                    content.extracted_text, content.word_count
+                )
+                if not is_blocked:
+                    return content
+                log_warning(
+                    "playwright_bot_detected",
+                    url=url,
+                    reason=block_reason,
+                )
+            else:
+                log_warning(
+                    "playwright_http_error",
+                    url=url,
+                    http_status=content.http_status,
+                )
+        except Exception as e:
+            log_warning("playwright_crashed", url=url, error=str(e))
 
         # Tier 2: Jina Reader API
         if self.settings.jina_api_key:
@@ -174,9 +178,14 @@ class ScraperWorker:
         except Exception as e:
             log_warning("wayback_fallback_failed", url=url, error=str(e))
 
-        # Alle Fallbacks gescheitert — Playwright-Ergebnis zurückgeben
+        # Alle Fallbacks gescheitert
         log_warning("all_scraping_methods_failed", url=url)
-        return content
+
+        if content is not None:
+            return content
+
+        # Playwright ist gecrasht und alle Fallbacks gescheitert
+        raise RuntimeError(f"All scraping methods failed for {url}")
 
     async def _scrape_with_playwright(self, url: str) -> ScrapedContent:
         """Tier 1: Playwright-basiertes Scraping."""
