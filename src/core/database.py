@@ -206,10 +206,13 @@ class ScanResultDB(Base):
     llm_provider = Column(String(50), nullable=False)
     llm_model = Column(String(100), nullable=False)
 
-    # Output-Analyse (KEIN Rohtext!)
+    # Output-Analyse
     output_length = Column(Integer, nullable=False)
     output_word_count = Column(Integer, nullable=False)
     output_format_detected = Column(String(50), nullable=False)
+
+    # LLM Output Text (die Zusammenfassung die das Test-LLM erzeugt hat)
+    llm_output_text = Column(Text, nullable=True)
 
     # Flags
     tool_calls_attempted = Column(Boolean, default=False, nullable=False)
