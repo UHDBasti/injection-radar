@@ -113,7 +113,11 @@ class ScraperWorker:
             await self.browser.close()
 
     async def scrape_url(self, url: str) -> ScrapedContent:
-        """Scraped eine URL und extrahiert den Content.
+        """Scraped eine URL mit Fallback-Chain.
+
+        Tier 1: Playwright (bestehend) — kostenlos, volle Kontrolle
+        Tier 2: Jina Reader API — bei 403/Bot-Detection
+        Tier 3: Wayback Machine — letzte Option, gecachte Version
 
         Args:
             url: Die zu scrapende URL.
@@ -121,6 +125,61 @@ class ScraperWorker:
         Returns:
             ScrapedContent mit allen extrahierten Daten.
         """
+        # Tier 1: Playwright
+        content = await self._scrape_with_playwright(url)
+
+        # Prüfen ob Playwright echten Content geliefert hat
+        if content.http_status < 400:
+            is_blocked, block_reason = is_bot_protection_page(
+                content.extracted_text, content.word_count
+            )
+            if not is_blocked:
+                return content
+            log_warning(
+                "playwright_bot_detected",
+                url=url,
+                reason=block_reason,
+            )
+        else:
+            log_warning(
+                "playwright_http_error",
+                url=url,
+                http_status=content.http_status,
+            )
+
+        # Tier 2: Jina Reader API
+        if self.settings.jina_api_key:
+            try:
+                jina_content = await self._scrape_with_jina(url)
+                if jina_content and jina_content.word_count > 10:
+                    log_info(
+                        "jina_fallback_success",
+                        url=url,
+                        word_count=jina_content.word_count,
+                    )
+                    return jina_content
+            except Exception as e:
+                log_warning("jina_fallback_failed", url=url, error=str(e))
+
+        # Tier 3: Wayback Machine
+        try:
+            wayback_content = await self._scrape_with_wayback(url)
+            if wayback_content and wayback_content.word_count > 10:
+                log_info(
+                    "wayback_fallback_success",
+                    url=url,
+                    word_count=wayback_content.word_count,
+                )
+                return wayback_content
+        except Exception as e:
+            log_warning("wayback_fallback_failed", url=url, error=str(e))
+
+        # Alle Fallbacks gescheitert — Playwright-Ergebnis zurückgeben
+        log_warning("all_scraping_methods_failed", url=url)
+        return content
+
+    async def _scrape_with_playwright(self, url: str) -> ScrapedContent:
+        """Tier 1: Playwright-basiertes Scraping."""
         if not self.browser:
             raise RuntimeError("Worker not started. Call start() first.")
 
@@ -187,6 +246,126 @@ class ScraperWorker:
 
         finally:
             await context.close()
+
+    async def _scrape_with_jina(self, url: str) -> Optional[ScrapedContent]:
+        """Tier 2: Jina Reader API Fallback.
+
+        Nutzt https://r.jina.ai/ um Seiteninhalte als Markdown zu extrahieren.
+        Funktioniert oft bei Sites die Playwright blocken, da Jina eigene
+        Infrastruktur/IPs nutzt.
+        """
+        log_info("jina_fallback_attempting", url=url)
+        start_time = datetime.now(timezone.utc)
+
+        headers = {
+            "Authorization": f"Bearer {self.settings.jina_api_key}",
+            "Accept": "application/json",
+            "X-Timeout": "30",
+        }
+
+        async with httpx.AsyncClient(timeout=35) as client:
+            resp = await client.get(f"https://r.jina.ai/{url}", headers=headers)
+
+            if resp.status_code != 200:
+                log_warning(
+                    "jina_http_error",
+                    url=url,
+                    status=resp.status_code,
+                )
+                return None
+
+            data = resp.json()
+            content_data = data.get("data", {})
+            extracted_text = content_data.get("content", "")
+            title = content_data.get("title", "")
+
+            if not extracted_text or len(extracted_text.split()) < 10:
+                log_warning("jina_empty_content", url=url)
+                return None
+
+            # Begrenze Textlänge
+            max_length = self.settings.scraping.max_page_size
+            if len(extracted_text) > max_length:
+                extracted_text = extracted_text[:max_length]
+
+            content_hash = hashlib.sha256(extracted_text.encode()).hexdigest()
+            response_time_ms = int(
+                (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            )
+
+            return ScrapedContent(
+                url_id=0,
+                scraped_at=datetime.utcnow(),
+                server_ip=None,
+                http_status=200,
+                response_time_ms=response_time_ms,
+                ssl_valid=url.startswith("https://"),
+                raw_html=extracted_text,  # Jina liefert Markdown, kein raw HTML
+                extracted_text=extracted_text,
+                text_length=len(extracted_text),
+                word_count=len(extracted_text.split()),
+                meta_tags={"title": title} if title else {},
+                scripts_content=[],
+                external_links=[],
+                content_hash=content_hash,
+            )
+
+    async def _scrape_with_wayback(self, url: str) -> Optional[ScrapedContent]:
+        """Tier 3: Wayback Machine Fallback.
+
+        Holt die letzte archivierte Version der Seite aus dem Internet Archive.
+        Kostenlos und unbegrenzt, aber Content kann veraltet sein.
+        """
+        log_info("wayback_fallback_attempting", url=url)
+        start_time = datetime.now(timezone.utc)
+
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            # Verfügbarkeit prüfen
+            avail_resp = await client.get(
+                "https://archive.org/wayback/available",
+                params={"url": url},
+            )
+            if avail_resp.status_code != 200:
+                return None
+
+            data = avail_resp.json()
+            snapshot = data.get("archived_snapshots", {}).get("closest")
+            if not snapshot or not snapshot.get("available"):
+                log_warning("wayback_no_snapshot", url=url)
+                return None
+
+            snapshot_url = snapshot["url"]
+
+            # Archivierte Seite laden
+            page_resp = await client.get(snapshot_url)
+            if page_resp.status_code != 200:
+                return None
+
+            raw_html = page_resp.text
+
+            # Text extrahieren (gleiche Logik wie Playwright)
+            extracted_text = await self._extract_text(None, raw_html)
+            content_hash = hashlib.sha256(raw_html.encode()).hexdigest()
+            response_time_ms = int(
+                (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            )
+
+            return ScrapedContent(
+                url_id=0,
+                scraped_at=datetime.utcnow(),
+                server_ip=None,
+                http_status=200,
+                response_time_ms=response_time_ms,
+                ssl_valid=url.startswith("https://"),
+                raw_html=raw_html,
+                extracted_text=extracted_text,
+                text_length=len(extracted_text),
+                word_count=len(extracted_text.split()),
+                meta_tags={},
+                scripts_content=[],
+                external_links=[],
+                content_hash=content_hash,
+            )
 
     async def _extract_text(self, page: Page, html: str) -> str:
         """Extrahiert lesbaren Text aus der Seite."""

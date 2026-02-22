@@ -183,6 +183,7 @@ class Settings(BaseSettings):
     openai_api_key: Optional[str] = Field(default=None, validation_alias="OPENAI_API_KEY")
     google_api_key: Optional[str] = Field(default=None, validation_alias="GOOGLE_API_KEY")
     xai_api_key: Optional[str] = Field(default=None, validation_alias="XAI_API_KEY")
+    jina_api_key: Optional[str] = Field(default=None, validation_alias="JINA_API_KEY")
 
     # Sub-Konfigurationen
     llm: LLMConfig = Field(default_factory=LLMConfig)
