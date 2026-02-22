@@ -21,6 +21,7 @@ services:
       timeout: 5s
       retries: 5
     cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, FOWNER, DAC_READ_SEARCH]
     logging:
       driver: json-file
       options:
@@ -146,6 +147,7 @@ services:
     volumes:
       - redis_data:/data
     cap_drop: [ALL]
+    cap_add: [SETUID, SETGID]
     logging:
       driver: json-file
       options:
