@@ -29,6 +29,7 @@ class ScanJob(BaseModel):
     url: str
     task_name: str = "summarize"
     priority: int = 5  # 1-10, höher = wichtiger
+    lang: str = "de"
     created_at: str = ""
 
     def __init__(self, **data):
@@ -50,6 +51,7 @@ class JobResult(BaseModel):
     flags_count: int = 0
     classification: str = "pending"
     flags: list[dict] = []
+    llm_summary: Optional[str] = None  # LLM output text (for display to users)
 
     # Metadaten
     llm_provider: Optional[str] = None
@@ -133,20 +135,21 @@ class JobQueue:
     # Orchestrator-Seite: Jobs einstellen und Ergebnisse abholen
     # -------------------------------------------------------------------------
 
-    async def enqueue_scan(self, url: str, task_name: str = "summarize", priority: int = 5) -> ScanJob:
+    async def enqueue_scan(self, url: str, task_name: str = "summarize", priority: int = 5, lang: str = "de") -> ScanJob:
         """Fügt einen Scan-Job in die Queue ein.
 
         Args:
             url: Die zu scannende URL
             task_name: Art des Tests (summarize, extract, etc.)
             priority: Priorität 1-10 (höher = wichtiger)
+            lang: Sprache für LLM-Prompts ("de" oder "en")
 
         Returns:
             ScanJob mit generierter job_id
         """
         r = await self._ensure_connected()
 
-        job = ScanJob(url=url, task_name=task_name, priority=priority)
+        job = ScanJob(url=url, task_name=task_name, priority=priority, lang=lang)
         job_json = job.model_dump_json()
 
         # In Queue einfügen (LPUSH für FIFO mit BRPOP)
@@ -287,10 +290,10 @@ def get_queue(config: Optional[QueueConfig] = None) -> JobQueue:
     return _default_queue
 
 
-async def enqueue_scan(url: str, task_name: str = "summarize") -> ScanJob:
+async def enqueue_scan(url: str, task_name: str = "summarize", lang: str = "de") -> ScanJob:
     """Shortcut zum Einstellen eines Jobs."""
     queue = get_queue()
-    return await queue.enqueue_scan(url, task_name)
+    return await queue.enqueue_scan(url, task_name, lang=lang)
 
 
 async def wait_for_result(job_id: str, timeout: int = 120) -> Optional[JobResult]:

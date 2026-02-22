@@ -253,6 +253,7 @@ class ScanRequest(BaseModel):
     """Request für einen URL-Scan."""
     url: HttpUrl
     task: str = "summarize"
+    lang: str = "de"
 
 
 class ScanResponse(BaseModel):
@@ -273,6 +274,8 @@ class ScanResponse(BaseModel):
     processing_time_ms: Optional[int] = None
     scanned_at: Optional[datetime] = None
     error_message: Optional[str] = None
+    reasoning: Optional[str] = None
+    llm_summary: Optional[str] = None
 
 
 class AsyncScanResponse(BaseModel):
@@ -445,7 +448,7 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
 
     try:
         # Job in Queue einstellen
-        job = await job_queue.enqueue_scan(url_str, request.task)
+        job = await job_queue.enqueue_scan(url_str, request.task, lang=request.lang)
 
         # Auf Ergebnis warten (blocking mit Timeout)
         result = await job_queue.get_result(
@@ -503,6 +506,8 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
             cost_estimated=result.cost_estimated,
             processing_time_ms=result.processing_time_ms,
             scanned_at=datetime.now(timezone.utc),
+            reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, lang=request.lang),
+            llm_summary=result.llm_summary,
         )
 
     except Exception as e:
@@ -522,7 +527,7 @@ async def scan_url_async(request: ScanRequest):
     url_str = str(request.url)
 
     try:
-        job = await job_queue.enqueue_scan(url_str, request.task)
+        job = await job_queue.enqueue_scan(url_str, request.task, lang=request.lang)
 
         log_info("async_scan_queued", job_id=job.job_id, url=url_str)
 
@@ -589,6 +594,8 @@ async def get_scan_status(job_id: str):
             processing_time_ms=result.processing_time_ms,
             scanned_at=datetime.utcnow(),
             error_message=result.error_message,
+            reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags, lang="de"),
+            llm_summary=result.llm_summary,
         ),
     )
 
@@ -863,6 +870,61 @@ async def get_dangerous_domains(
 # Helper Functions
 # ============================================================================
 
+def _generate_reasoning(classification: str, severity_score: float, flags: list[dict], lang: str = "de") -> str:
+    """Generates a human-readable summary of the scan result."""
+    if classification == "safe":
+        if lang == "en":
+            return "No suspicious patterns detected. The website content was processed normally by the test LLM."
+        return "Keine verdächtigen Muster erkannt. Die Website-Inhalte wurden vom Test-LLM normal verarbeitet."
+
+    # Group flags by severity
+    critical_flags = [f for f in flags if f.get("severity") == "critical"]
+    high_flags = [f for f in flags if f.get("severity") == "high"]
+    medium_flags = [f for f in flags if f.get("severity") == "medium"]
+    low_flags = [f for f in flags if f.get("severity") == "low"]
+
+    parts = []
+
+    if lang == "en":
+        if classification == "dangerous":
+            parts.append(f"WARNING: {len(flags)} security-relevant patterns detected (severity {severity_score:.1f}/10).")
+        else:
+            parts.append(f"{len(flags)} suspicious patterns detected (severity {severity_score:.1f}/10).")
+
+        if critical_flags:
+            descs = [f.get("description", "") for f in critical_flags]
+            parts.append(f"Critical: {'; '.join(descs)}")
+        if high_flags:
+            descs = [f.get("description", "") for f in high_flags]
+            parts.append(f"High: {'; '.join(descs)}")
+        if medium_flags:
+            descs = [f.get("description", "") for f in medium_flags]
+            parts.append(f"Medium: {'; '.join(descs)}")
+        if low_flags:
+            descs = [f.get("description", "") for f in low_flags]
+            parts.append(f"Low: {'; '.join(descs)}")
+    else:
+        if classification == "dangerous":
+            parts.append(f"WARNUNG: Es wurden {len(flags)} sicherheitsrelevante Muster erkannt (Schweregrad {severity_score:.1f}/10).")
+        else:
+            parts.append(f"Es wurden {len(flags)} auffällige Muster erkannt (Schweregrad {severity_score:.1f}/10).")
+
+        if critical_flags:
+            descs = [f.get("description", "") for f in critical_flags]
+            parts.append(f"Kritisch: {'; '.join(descs)}")
+        if high_flags:
+            descs = [f.get("description", "") for f in high_flags]
+            parts.append(f"Hoch: {'; '.join(descs)}")
+        if medium_flags:
+            descs = [f.get("description", "") for f in medium_flags]
+            parts.append(f"Mittel: {'; '.join(descs)}")
+        if low_flags:
+            descs = [f.get("description", "") for f in low_flags]
+            parts.append(f"Niedrig: {'; '.join(descs)}")
+
+    return " ".join(parts)
+
+
 def _calculate_confidence(severity_score: float, classification: str) -> float:
     """Berechnet die Confidence basierend auf Severity und Classification."""
     if classification == "dangerous":
@@ -953,6 +1015,7 @@ async def _save_scan_results(url_str: str, result: JobResult, confidence: float)
                 output_length=result.tokens_output,
                 output_word_count=0,
                 output_format_detected="text",
+                llm_output_text=result.llm_summary,
                 tool_calls_attempted=any(
                     f.get("type") == "tool_call" for f in result.flags
                 ),
@@ -977,7 +1040,7 @@ async def _save_scan_results(url_str: str, result: JobResult, confidence: float)
                 confidence=confidence,
                 severity_score=result.severity_score,
                 flags_triggered=result.flags,
-                reasoning=f"Automated scan: {result.flags_count} flags, severity {result.severity_score:.1f}",
+                reasoning=_generate_reasoning(result.classification, result.severity_score, result.flags),
                 analyzed_at=datetime.utcnow(),
             )
             session.add(analysis_db)

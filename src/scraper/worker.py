@@ -37,10 +37,7 @@ from sqlalchemy import select
 from ..core.queue import JobQueue, QueueConfig, ScanJob, JobResult
 from ..core.logging import log_info, log_error, log_warning, log_debug, log_error_with_trace, setup_logging
 from ..llm import AnthropicClient, OpenAIClient, LLMResult, DUMMY_TOOLS
-from ..llm.anthropic import (
-    SUMMARIZE_SYSTEM_PROMPT,
-    SUMMARIZE_USER_PROMPT_TEMPLATE,
-)
+from ..llm.anthropic import get_prompts
 from ..analysis.detector import RedFlagDetector
 from .stealth import get_random_user_agent, apply_stealth, is_bot_protection_page
 
@@ -284,7 +281,8 @@ class ScraperWorker:
         self,
         content: ScrapedContent,
         task_name: str = "summarize",
-    ) -> ScanResult:
+        lang: str = "de",
+    ) -> tuple[ScanResult, str]:
         """Führt einen LLM-Test mit dem gescrapten Content durch.
 
         Args:
@@ -292,7 +290,7 @@ class ScraperWorker:
             task_name: Name der Test-Aufgabe.
 
         Returns:
-            ScanResult mit den Analyseergebnissen.
+            Tuple of (ScanResult mit den Analyseergebnissen, LLM output text).
         """
         # LLM-Client initialisieren
         if self.settings.anthropic_api_key:
@@ -311,14 +309,15 @@ class ScraperWorker:
         else:
             raise ValueError("No LLM API key configured")
 
-        # Prompt erstellen
-        user_prompt = SUMMARIZE_USER_PROMPT_TEMPLATE.format(
+        # Prompt erstellen (sprachabhängig)
+        system_prompt, user_prompt_template = get_prompts(task_name, lang)
+        user_prompt = user_prompt_template.format(
             content=content.extracted_text[:self.settings.llm.max_input_tokens * 4]
         )
 
         # LLM aufrufen MIT Tool-Definitionen (um Tool-Call-Verhalten zu testen)
         result = await client.generate(
-            system_prompt=SUMMARIZE_SYSTEM_PROMPT,
+            system_prompt=system_prompt,
             user_prompt=user_prompt,
             tools=DUMMY_TOOLS,
         )
@@ -353,7 +352,7 @@ class ScraperWorker:
             tokens_input=result.tokens_input,
             tokens_output=result.tokens_output,
             cost_estimated=result.cost_estimated,
-        )
+        ), result.text
 
 
 def _handle_shutdown_signal(signum, frame):
@@ -555,7 +554,7 @@ async def worker_main():
                             # 3d. LLM-Test durchführen (only for valid responses)
                             # =========================================================
                             log_info("llm_test_started", job_id=job.job_id, url=job.url)
-                            scan_result = await worker.run_llm_test(content, task_name=job.task_name)
+                            scan_result, llm_output_text = await worker.run_llm_test(content, task_name=job.task_name, lang=job.lang)
 
                             # Content-Flags mit LLM-Flags zusammenführen (Duplikate vermeiden)
                             existing_types = {
@@ -610,9 +609,11 @@ async def worker_main():
                                         "type": flag.type.value,
                                         "severity": flag.severity.value,
                                         "description": flag.description,
+                                        "evidence": flag.evidence,
                                     }
                                     for flag in scan_result.flags_detected
                                 ],
+                                llm_summary=llm_output_text,
                                 llm_provider=scan_result.llm_provider,
                                 llm_model=scan_result.llm_model,
                                 tokens_input=scan_result.tokens_input,
@@ -684,7 +685,7 @@ async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
             raw_html=content.raw_html,
         )
 
-        scan_result = await worker.run_llm_test(content)
+        scan_result, llm_output_text = await worker.run_llm_test(content)
 
         # Content-Flags mit LLM-Flags zusammenführen (Duplikate vermeiden)
         existing_types = {
@@ -717,9 +718,11 @@ async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
                     "type": flag.type.value,
                     "severity": flag.severity.value,
                     "description": flag.description,
+                    "evidence": flag.evidence,
                 }
                 for flag in scan_result.flags_detected
             ],
+            llm_summary=llm_output_text,
             llm_provider=scan_result.llm_provider,
             llm_model=scan_result.llm_model,
             tokens_input=scan_result.tokens_input,
