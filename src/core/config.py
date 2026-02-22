@@ -3,13 +3,15 @@ Konfigurationsmanagement für Prompt Injection Shield.
 """
 
 import os
+import warnings
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import URL
 
 
 class LLMConfig(BaseSettings):
@@ -62,17 +64,39 @@ class DatabaseConfig(BaseSettings):
 
     @property
     def url(self) -> str:
-        """Generiert die Datenbank-URL."""
+        """Generiert die Datenbank-URL.
+
+        Uses SQLAlchemy URL.create() to properly escape special characters
+        in passwords instead of embedding them in f-strings.
+        """
         if self.type == "sqlite":
             return f"sqlite:///{self.sqlite_path}"
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+        return URL.create(
+            drivername="postgresql",
+            username=self.user,
+            password=self.password,
+            host=self.host,
+            port=self.port,
+            database=self.name,
+        ).render_as_string(hide_password=False)
 
     @property
     def async_url(self) -> str:
-        """Generiert die async Datenbank-URL."""
+        """Generiert die async Datenbank-URL.
+
+        Uses SQLAlchemy URL.create() to properly escape special characters
+        in passwords instead of embedding them in f-strings.
+        """
         if self.type == "sqlite":
             return f"sqlite+aiosqlite:///{self.sqlite_path}"
-        return f"postgresql+asyncpg://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+        return URL.create(
+            drivername="postgresql+asyncpg",
+            username=self.user,
+            password=self.password,
+            host=self.host,
+            port=self.port,
+            database=self.name,
+        ).render_as_string(hide_password=False)
 
 
 class ScrapingConfig(BaseSettings):
@@ -124,6 +148,7 @@ class APIConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     rate_limit_per_minute: int = 60
+    cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000"])
 
 
 class MCPConfig(BaseSettings):
@@ -142,11 +167,15 @@ class RedisConfig(BaseSettings):
     host: str = "localhost"
     port: int = 6379
 
+    db: int = 0
+    password: Optional[str] = None
+
     def __init__(self, **data):
         """Liest Umgebungsvariablen manuell."""
         env_mapping = {
             "REDIS_HOST": "host",
             "REDIS_PORT": "port",
+            "REDIS_PASSWORD": "password",
         }
         for env_key, field_name in env_mapping.items():
             if env_key in os.environ and field_name not in data:
@@ -155,8 +184,6 @@ class RedisConfig(BaseSettings):
                     value = int(value)
                 data[field_name] = value
         super().__init__(**data)
-    db: int = 0
-    password: Optional[str] = None
 
     # Queue Settings
     job_timeout_seconds: int = 120
@@ -199,6 +226,21 @@ class Settings(BaseSettings):
     # Logging
     log_level: str = "INFO"
     log_file: str = "logs/pishield.log"
+
+    @model_validator(mode="after")
+    def validate_required_secrets(self) -> "Settings":
+        """Validates that critical secrets are configured at startup."""
+        if self.database.type == "postgresql" and not self.database.password:
+            warnings.warn(
+                "PostgreSQL database password is empty! "
+                "Set DB_PASSWORD or PISHIELD_DB_PASSWORD."
+            )
+        if not self.anthropic_api_key and not self.openai_api_key:
+            warnings.warn(
+                "No LLM API key configured. "
+                "Set ANTHROPIC_API_KEY or OPENAI_API_KEY."
+            )
+        return self
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "Settings":

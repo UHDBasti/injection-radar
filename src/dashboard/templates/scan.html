@@ -4,11 +4,18 @@
 <h2>Scan URL</h2>
 
 <form hx-post="/dashboard/scan" hx-target="#scan-result" hx-indicator="#scan-spinner">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <fieldset role="group">
         <input type="url" name="url" placeholder="https://example.com" required>
         <button type="submit">Scan</button>
     </fieldset>
 </form>
+
+{% if error_message %}
+<article>
+    <p><strong>Error:</strong> {{ error_message }}</p>
+</article>
+{% endif %}
 
 <p id="scan-spinner" class="htmx-indicator" aria-busy="true">Scanning... this may take a moment.</p>
 

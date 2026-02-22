@@ -9,15 +9,20 @@ ausschließlich strukturierte JobResults.
 """
 
 import asyncio
+import ipaddress
+import os
+import re
+import socket
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
 import redis.asyncio as aioredis
 import structlog
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Response
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks, Request, Response, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
@@ -47,6 +52,72 @@ SessionFactory = None
 job_queue: Optional[JobQueue] = None
 rate_limit_redis: Optional[aioredis.Redis] = None
 scan_scheduler: Optional[ScanScheduler] = None
+
+
+# Private IP networks for SSRF protection
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+]
+
+# Docker internal hostnames that must be blocked
+_BLOCKED_HOSTNAMES = {
+    "db", "redis", "orchestrator", "localhost", "host.docker.internal",
+}
+
+
+def _validate_url_not_internal(url: str) -> None:
+    """Validate that a URL does not point to an internal/private address.
+
+    Raises HTTPException(400) if the URL resolves to a private IP or
+    targets a blocked internal hostname.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(status_code=400, detail="Invalid URL: no hostname")
+
+    # Block known Docker-internal hostnames
+    if hostname.lower() in _BLOCKED_HOSTNAMES:
+        raise HTTPException(status_code=400, detail="Scanning internal hosts is not allowed")
+
+    # Resolve hostname and check against private ranges
+    try:
+        addrinfos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        raise HTTPException(status_code=400, detail="Could not resolve hostname")
+
+    for family, _, _, _, sockaddr in addrinfos:
+        ip = ipaddress.ip_address(sockaddr[0])
+        for network in _PRIVATE_NETWORKS:
+            if ip in network:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Scanning internal hosts is not allowed",
+                )
+
+
+async def verify_api_key(x_api_key: Optional[str] = Header(None)) -> None:
+    """FastAPI dependency that checks X-API-Key header against API_SECRET_KEY.
+
+    If API_SECRET_KEY is not configured (dev mode), all requests are allowed
+    with a warning logged on first call.
+    """
+    secret = os.environ.get("API_SECRET_KEY")
+    if not secret:
+        # Dev mode – no key required but warn once
+        if not getattr(verify_api_key, "_warned", False):
+            log_warning("api_key_not_configured", message="API_SECRET_KEY not set – all write endpoints are unprotected")
+            verify_api_key._warned = True
+        return
+    if not x_api_key or x_api_key != secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @asynccontextmanager
@@ -122,13 +193,25 @@ from ..dashboard.routes import dashboard_router
 app.include_router(dashboard_router)
 
 # CORS Middleware
+_cors_origins = settings.api.cors_origins if hasattr(settings, 'api') and settings.api.cors_origins else ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In Produktion einschränken!
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-API-Key", "Authorization"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Add security headers to every response."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    return response
 
 
 class RequestIDMiddleware(BaseHTTPMiddleware):
@@ -174,11 +257,14 @@ def _get_rate_limit(path: str) -> int:
 
 
 def _get_client_ip(request: Request) -> str:
-    """Extract client IP, respecting X-Forwarded-For behind a reverse proxy."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Extract client IP, only trusting X-Forwarded-For from known proxies."""
+    client_ip = request.client.host if request.client else "unknown"
+    # Only trust X-Forwarded-For if request comes from known proxy (localhost/docker)
+    if client_ip in ("127.0.0.1", "::1", "172.17.0.1"):
+        forwarded = request.headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    return client_ip
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
@@ -431,7 +517,7 @@ async def get_status():
 
 
 @app.post("/scan", response_model=ScanResponse)
-async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
+async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks, _auth: None = Depends(verify_api_key)):
     """Scannt eine URL auf Prompt Injection (synchron, wartet auf Ergebnis).
 
     Der Orchestrator:
@@ -444,6 +530,7 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=503, detail="Queue not available")
 
     url_str = str(request.url)
+    _validate_url_not_internal(url_str)
     log_info("scan_requested", url=url_str, task=request.task)
 
     try:
@@ -511,13 +598,15 @@ async def scan_url(request: ScanRequest, background_tasks: BackgroundTasks):
             llm_summary=result.llm_summary,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_error("scan_error", url=url_str, error=str(e))
-        raise HTTPException(status_code=500, detail=f"Scan failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.post("/scan/async", response_model=AsyncScanResponse)
-async def scan_url_async(request: ScanRequest):
+async def scan_url_async(request: ScanRequest, _auth: None = Depends(verify_api_key)):
     """Startet einen asynchronen Scan (gibt sofort Job-ID zurück).
 
     Nutze GET /scan/{job_id}/status um den Status abzufragen.
@@ -526,6 +615,7 @@ async def scan_url_async(request: ScanRequest):
         raise HTTPException(status_code=503, detail="Queue not available")
 
     url_str = str(request.url)
+    _validate_url_not_internal(url_str)
 
     try:
         job = await job_queue.enqueue_scan(url_str, request.task, lang=request.lang)
@@ -539,17 +629,24 @@ async def scan_url_async(request: ScanRequest):
             message="Scan queued. Poll /scan/{job_id}/status for results.",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to queue scan: {str(e)}")
+        log_error("async_scan_error", url=url_str, error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # Track which job_ids have already been persisted to DB (avoid duplicates on poll)
-_persisted_jobs: set[str] = set()
+_PERSISTED_JOBS_MAX = 10000
+_persisted_jobs: OrderedDict[str, None] = OrderedDict()
 
 
 @app.get("/scan/{job_id}/status", response_model=JobStatusResponse)
 async def get_scan_status(job_id: str):
     """Prüft den Status eines laufenden Scans."""
+    if not re.match(r'^[a-zA-Z0-9_-]{1,64}$', job_id):
+        raise HTTPException(status_code=400, detail="Invalid job_id format")
+
     if not job_queue:
         raise HTTPException(status_code=503, detail="Queue not available")
 
@@ -566,14 +663,11 @@ async def get_scan_status(job_id: str):
 
     # Persist results when completed - only once per job_id
     if result.status == "completed" and job_id not in _persisted_jobs:
-        _persisted_jobs.add(job_id)
+        _persisted_jobs[job_id] = None
         await _save_scan_results(result.url, result, confidence)
-        # Limit set size to prevent memory leak
-        if len(_persisted_jobs) > 10000:
-            # Remove oldest entries (set is unordered, just trim)
-            excess = len(_persisted_jobs) - 5000
-            for _ in range(excess):
-                _persisted_jobs.pop()
+        # Evict oldest entries when over capacity
+        while len(_persisted_jobs) > _PERSISTED_JOBS_MAX:
+            _persisted_jobs.popitem(last=False)
 
     return JobStatusResponse(
         job_id=job_id,
@@ -739,11 +833,10 @@ async def get_queue_stats():
         length = await job_queue.get_queue_length()
         return {
             "queue_length": length,
-            "redis_host": settings.redis.host,
-            "redis_port": settings.redis.port,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Queue error: {str(e)}")
+        log_error("queue_stats_error", error=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 @app.get("/scheduler/status")
@@ -759,7 +852,7 @@ async def scheduler_status():
 
 
 @app.post("/scheduler/trigger")
-async def scheduler_trigger():
+async def scheduler_trigger(_auth: None = Depends(verify_api_key)):
     """Manually trigger a rescan check (regardless of schedule)."""
     if scan_scheduler is None:
         raise HTTPException(

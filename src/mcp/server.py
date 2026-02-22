@@ -12,7 +12,9 @@ Bietet folgende Tools:
 """
 
 import asyncio
+import html
 import json
+import re
 from typing import Any
 from urllib.parse import urlparse
 
@@ -67,6 +69,35 @@ def _normalize_url(url: str) -> str:
 def _validate_limit(limit: int, min_val: int = 1, max_val: int = 100) -> int:
     """Clamps limit to valid range."""
     return max(min_val, min(limit, max_val))
+
+
+def _sanitize_flags_for_mcp(flags: list[dict]) -> list[dict]:
+    """Remove potentially malicious evidence content from flags for MCP consumers."""
+    sanitized = []
+    for flag in flags:
+        safe_flag = {
+            "type": flag.get("type", "unknown"),
+            "severity": flag.get("severity", "unknown"),
+            "description": flag.get("description", "")[:200],
+            "confidence": flag.get("confidence", 0),
+        }
+        # Deliberately omit "evidence" field - it contains attacker-controlled content
+        sanitized.append(safe_flag)
+    return sanitized
+
+
+def _sanitize_text_for_mcp(text: str | None, max_length: int = 500) -> str | None:
+    """Sanitize free-text fields before returning to MCP consumers.
+
+    Strips HTML tags and entities, truncates to max_length.
+    """
+    if not text:
+        return None
+    # Strip HTML tags
+    cleaned = re.sub(r"<[^>]+>", "", text)
+    # Unescape HTML entities then re-escape to neutralize any injection
+    cleaned = html.escape(html.unescape(cleaned))
+    return cleaned[:max_length]
 
 
 async def _api_request(
@@ -297,15 +328,15 @@ def create_mcp_server(api_url: str | None = None) -> tuple["Server", httpx.Async
             return [TextContent(type="text", text=json.dumps({"error": error_msg}, indent=2))]
 
         except httpx.HTTPStatusError as e:
-            error_msg = f"API returned HTTP {e.response.status_code}: {e.response.text[:200]}"
-            log.error("tool_http_error", tool=name, status_code=e.response.status_code)
+            log.error("tool_http_error", tool=name, status_code=e.response.status_code, detail=e.response.text[:200])
+            error_msg = f"API returned HTTP {e.response.status_code}. Check server logs for details."
             return [TextContent(type="text", text=json.dumps({"error": error_msg}, indent=2))]
 
         except Exception as e:
             log.error("tool_error", tool=name, error=str(e), error_type=type(e).__name__)
             return [TextContent(
                 type="text",
-                text=json.dumps({"error": f"Unexpected error: {type(e).__name__}: {e}"}, indent=2)
+                text=json.dumps({"error": "Scan failed. Check server logs for details."}, indent=2)
             )]
 
     return server, client
@@ -327,15 +358,19 @@ async def _scan_url(client: httpx.AsyncClient, api_url: str, max_retries: int, u
     )
 
     result = response.json()
-    return {
+    response_data = {
         "url": url,
         "classification": result.get("classification", "unknown"),
         "severity_score": result.get("severity_score", 0),
         "is_dangerous": result.get("classification") == "dangerous",
         "flags_count": len(result.get("flags") or []),
-        "flags": result.get("flags") or [],
+        "flags": _sanitize_flags_for_mcp(result.get("flags") or []),
         "summary": _generate_summary(result),
     }
+    llm_summary = result.get("llm_summary")
+    if llm_summary:
+        response_data["llm_summary"] = _sanitize_text_for_mcp(llm_summary)
+    return response_data
 
 
 async def _scan_urls(client: httpx.AsyncClient, api_url: str, max_retries: int, urls: list[str]) -> dict:
@@ -375,10 +410,11 @@ async def _scan_urls(client: httpx.AsyncClient, api_url: str, max_retries: int, 
 
     for url, response in zip(normalized, responses):
         if isinstance(response, Exception):
+            log.error("mcp_scan_url_error", url=url, error=str(response))
             results.append({
                 "url": url,
                 "status": "error",
-                "error": f"{type(response).__name__}: {response}",
+                "error": "Scan failed. Check server logs for details.",
             })
             error_count += 1
         else:
@@ -421,7 +457,22 @@ async def _get_history(client: httpx.AsyncClient, api_url: str, max_retries: int
         max_retries=max_retries,
         params={"limit": limit},
     )
-    return response.json()
+    data = response.json()
+    # Sanitize any flags/llm_summary in history entries
+    if isinstance(data, dict) and "results" in data:
+        for entry in data.get("results") or []:
+            if "flags" in entry:
+                entry["flags"] = _sanitize_flags_for_mcp(entry.get("flags") or [])
+            if "llm_summary" in entry:
+                entry["llm_summary"] = _sanitize_text_for_mcp(entry.get("llm_summary"))
+    elif isinstance(data, list):
+        for entry in data:
+            if isinstance(entry, dict):
+                if "flags" in entry:
+                    entry["flags"] = _sanitize_flags_for_mcp(entry.get("flags") or [])
+                if "llm_summary" in entry:
+                    entry["llm_summary"] = _sanitize_text_for_mcp(entry.get("llm_summary"))
+    return data
 
 
 async def _check_url(client: httpx.AsyncClient, api_url: str, max_retries: int, url: str) -> dict:
@@ -440,6 +491,11 @@ async def _check_url(client: httpx.AsyncClient, api_url: str, max_retries: int, 
         )
         data = response.json()
         data["scanned"] = True
+        # Sanitize attacker-controlled fields
+        if "flags" in data:
+            data["flags"] = _sanitize_flags_for_mcp(data.get("flags") or [])
+        if "llm_summary" in data:
+            data["llm_summary"] = _sanitize_text_for_mcp(data.get("llm_summary"))
         return data
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 404:
@@ -476,12 +532,14 @@ async def _get_system_status(client: httpx.AsyncClient, api_url: str, max_retrie
     results = await asyncio.gather(health_task, status_task, return_exceptions=True)
 
     if isinstance(results[0], Exception):
-        errors.append(f"Health check failed: {results[0]}")
+        log.error("health_check_failed", error=str(results[0]))
+        errors.append("Health check failed. Check server logs for details.")
     else:
         health_data = results[0].json()
 
     if isinstance(results[1], Exception):
-        errors.append(f"Status check failed: {results[1]}")
+        log.error("status_check_failed", error=str(results[1]))
+        errors.append("Status check failed. Check server logs for details.")
     else:
         status_data = results[1].json()
 

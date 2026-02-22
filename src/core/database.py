@@ -20,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy import JSON
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.engine import URL, make_url
 
 # Verwende JSON für SQLite-Kompatibilität, JSONB für PostgreSQL
 def get_json_type(url: str):
@@ -291,22 +292,44 @@ class CrawlCheckpointDB(Base):
 
 # Database Connection Utilities
 
+def _make_url(database_url: str) -> URL:
+    """Parse a database URL string into a SQLAlchemy URL object.
+
+    Using URL objects prevents passwords from appearing in logs,
+    since repr(URL) redacts the password automatically.
+    """
+    return make_url(database_url)
+
+
 def get_sync_engine(database_url: str):
     """Erstellt eine synchrone Engine."""
-    if "sqlite" in database_url:
-        return create_engine(database_url, connect_args={"check_same_thread": False})
-    return create_engine(database_url, pool_pre_ping=True)
+    url = _make_url(database_url)
+    if url.get_backend_name() == "sqlite":
+        return create_engine(url, connect_args={"check_same_thread": False})
+    return create_engine(
+        url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+    )
 
 
 def get_async_engine(database_url: str):
     """Erstellt eine asynchrone Engine."""
-    if "sqlite" in database_url:
-        # SQLite async URL
-        async_url = database_url.replace("sqlite:///", "sqlite+aiosqlite:///")
+    url = _make_url(database_url)
+    if url.get_backend_name() == "sqlite":
+        async_url = url.set(drivername="sqlite+aiosqlite")
         return create_async_engine(async_url)
     # PostgreSQL async URL
-    async_url = database_url.replace("postgresql://", "postgresql+asyncpg://")
-    return create_async_engine(async_url, pool_pre_ping=True)
+    async_url = url.set(drivername="postgresql+asyncpg")
+    return create_async_engine(
+        async_url,
+        pool_pre_ping=True,
+        pool_size=5,
+        max_overflow=10,
+        pool_timeout=30,
+    )
 
 
 def get_async_session_factory(engine):

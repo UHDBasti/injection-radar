@@ -9,19 +9,26 @@ services:
     environment:
       POSTGRES_DB: pishield
       POSTGRES_USER: pishield
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pishield"]
       interval: 10s
       timeout: 5s
       retries: 5
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
-      - pishield-network
+      - backend-network
+      - scraper-network
 
   # ==========================================================================
   # Hauptsystem (Orchestrator)
@@ -46,10 +53,11 @@ services:
       - PISHIELD_DB_PORT=5432
       - PISHIELD_DB_NAME=pishield
       - PISHIELD_DB_USER=pishield
-      - PISHIELD_DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - PISHIELD_DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set}
       # Redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
       # API Keys kommen aus env_file (../.env)
     volumes:
       # Config wird NICHT gemountet - nutzt nur Umgebungsvariablen
@@ -57,8 +65,24 @@ services:
       - logs:/app/logs
     ports:
       - "8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
-      - pishield-network
+      - backend-network
 
   # ==========================================================================
   # Scraper Sandbox Pool (Template für Scaling)
@@ -88,19 +112,26 @@ services:
       - PISHIELD_DB_PORT=5432
       - PISHIELD_DB_NAME=pishield
       - PISHIELD_DB_USER=pishield
-      - PISHIELD_DB_PASSWORD=${DB_PASSWORD:-changeme}
+      - PISHIELD_DB_PASSWORD=${DB_PASSWORD:?DB_PASSWORD must be set}
       # Redis
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
       # API Keys kommen aus env_file (../.env)
     # Kein Zugriff auf Host-Filesystem (Isolation)
     read_only: true
     tmpfs:
-      - /tmp
+      - /tmp:size=100M,noexec,nosuid
     security_opt:
       - no-new-privileges:true
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
-      - pishield-network
+      - scraper-network
 
   # ==========================================================================
   # Redis (für Job Queue)
@@ -109,12 +140,20 @@ services:
     image: redis:7-alpine
     container_name: pishield-redis
     restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set}
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
+    cap_drop: [ALL]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
-      - pishield-network
+      - backend-network
+      - scraper-network
 
 volumes:
   postgres_data:
@@ -122,5 +161,7 @@ volumes:
   logs:
 
 networks:
-  pishield-network:
+  backend-network:
+    driver: bridge
+  scraper-network:
     driver: bridge

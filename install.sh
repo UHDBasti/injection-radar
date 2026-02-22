@@ -252,9 +252,17 @@ fi
 if [ "$DOCKER_AVAILABLE" = true ]; then
     log_info "Starte alle Docker Services (DB, Redis)..."
 
-    # Setze Umgebungsvariablen für docker-compose
-    export DB_PASSWORD="pishield123"
-    export PISHIELD_DB_PASSWORD="pishield123"
+    # Generiere oder lade DB-Passwort
+    if [ -f ".env" ] && grep -q "^PISHIELD_DB_PASSWORD=.\+" .env; then
+        # Lade existierendes Passwort aus .env
+        PISHIELD_DB_PASSWORD=$(grep "^PISHIELD_DB_PASSWORD=" .env | cut -d= -f2-)
+    else
+        # Generiere neues sicheres Passwort
+        PISHIELD_DB_PASSWORD=$(openssl rand -base64 24)
+        log_info "Neues DB-Passwort generiert"
+    fi
+    export DB_PASSWORD="$PISHIELD_DB_PASSWORD"
+    export PISHIELD_DB_PASSWORD
 
     # Lade API Keys aus .env wenn vorhanden
     if [ -f ".env" ]; then
@@ -286,12 +294,15 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
         cd docker
 
         # Nur DB und Redis beim Install starten (schneller)
-        if $COMPOSE_CMD up -d db redis 2>&1 | tee /tmp/compose-output.log; then
+        COMPOSE_LOG=$(mktemp)
+        chmod 600 "$COMPOSE_LOG"
+        if $COMPOSE_CMD up -d db redis > "$COMPOSE_LOG" 2>&1; then
             log_success "Basis-Services gestartet (DB, Redis)"
         else
             log_error "Docker Compose fehlgeschlagen:"
-            cat /tmp/compose-output.log
+            cat "$COMPOSE_LOG"
         fi
+        rm -f "$COMPOSE_LOG"
 
         cd ..
 
@@ -316,7 +327,7 @@ if [ "$DOCKER_AVAILABLE" = true ]; then
 
     # Update config mit DB Password
     if [ -f "config/config.yaml" ]; then
-        sed -i 's/password: "changeme"/password: "pishield123"/' config/config.yaml 2>/dev/null || true
+        sed -i "s/password: \"changeme\"/password: \"${PISHIELD_DB_PASSWORD}\"/" config/config.yaml 2>/dev/null || true
     fi
 else
     log_warn "Docker nicht verfügbar - nutze lokalen SQLite Modus"
@@ -354,7 +365,11 @@ fi
 log_info "Erstelle .env Datei..."
 
 if [ ! -f ".env" ]; then
-    cat > .env << 'ENVEOF'
+    # Generiere Passwort falls noch nicht gesetzt (z.B. kein Docker-Pfad)
+    if [ -z "$PISHIELD_DB_PASSWORD" ]; then
+        PISHIELD_DB_PASSWORD=$(openssl rand -base64 24)
+    fi
+    cat > .env << ENVEOF
 # InjectionRadar Environment Variables
 # Kopiere diese Datei und fülle die API Keys aus
 
@@ -363,9 +378,10 @@ ANTHROPIC_API_KEY=
 OPENAI_API_KEY=
 
 # Datenbank (wird automatisch gesetzt wenn Docker verwendet wird)
-PISHIELD_DB_PASSWORD=pishield123
+PISHIELD_DB_PASSWORD=${PISHIELD_DB_PASSWORD}
 ENVEOF
-    log_success ".env Datei erstellt"
+    chmod 600 .env
+    log_success ".env Datei erstellt (mit generiertem DB-Passwort)"
     log_warn "Bitte füge deinen API Key in .env ein!"
 else
     log_warn ".env existiert bereits"

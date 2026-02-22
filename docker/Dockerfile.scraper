@@ -1,13 +1,20 @@
 # Prompt Injection Shield - Scraper Sandbox (Subsystem)
-FROM python:3.11-slim
+
+# Stage 1: Builder - install Python dependencies
+FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf AS builder
+
+WORKDIR /build
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# Stage 2: Final - minimal runtime image with Playwright
+FROM python:3.11-slim@sha256:0b23cfb7425d065008b778022a17b1551c82f8b4866ee5a7a200084b7e2eafbf
 
 WORKDIR /app
 
-# System dependencies für Playwright
-RUN apt-get update && apt-get install -y \
-    curl \
-    wget \
-    gnupg \
+# System dependencies for Playwright/Chromium (runtime deps - must stay in final image)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -26,19 +33,21 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy installed Python packages from builder
+COPY --from=builder /install /usr/local
 
 # Create non-root user BEFORE installing Playwright
 RUN useradd -m -u 1000 scraper
 
-# Playwright Browser-Pfad für alle User zugänglich
+# Playwright Browser-Pfad with proper permissions (no world-writable)
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
-RUN mkdir -p /opt/playwright && chmod 777 /opt/playwright
+RUN mkdir -p /opt/playwright && chown scraper:scraper /opt/playwright && chmod 755 /opt/playwright
 
-# Install Playwright browsers (als root, aber in shared directory)
-RUN playwright install chromium && playwright install-deps chromium
+# Install Playwright browsers as scraper user
+USER scraper
+RUN playwright install chromium
+USER root
+RUN playwright install-deps chromium && rm -rf /var/lib/apt/lists/*
 
 # Application code - nur Scraper-relevante Module
 COPY src/scraper/ ./src/scraper/
@@ -51,10 +60,10 @@ COPY src/__init__.py ./src/
 RUN chown -R scraper:scraper /app
 USER scraper
 
-# Kein exposed Port - kommuniziert nur über DB/Redis
-
 # Unbuffered output für Docker logs
 ENV PYTHONUNBUFFERED=1
+
+# Kein exposed Port - kommuniziert nur über DB/Redis
 
 # Start Scraper Worker
 CMD ["python", "-m", "src.scraper.worker"]

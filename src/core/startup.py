@@ -171,7 +171,10 @@ class StartupManager:
 
             # Umgebungsvariablen setzen
             env = os.environ.copy()
-            env["DB_PASSWORD"] = env.get("PISHIELD_DB_PASSWORD", "pishield123")
+            env["DB_PASSWORD"] = env.get("PISHIELD_DB_PASSWORD", env.get("DB_PASSWORD", ""))
+
+            if not env.get("DB_PASSWORD"):
+                raise RuntimeError("DB_PASSWORD or PISHIELD_DB_PASSWORD must be set. Generate one with: openssl rand -base64 24")
 
             # API Keys übernehmen
             for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"]:

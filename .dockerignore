@@ -1,0 +1,86 @@
+# Secrets and environment - NEVER include in images
+.env
+.env.*
+.env.local
+.env.production
+config/config.yaml
+config/secrets.yaml
+.api_keys
+api_keys.json
+secrets.json
+
+# Git
+.git/
+.gitignore
+
+# Python
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+*.cover
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data and databases
+data/
+*.db
+*.sqlite
+*.sqlite3
+top-1m.csv
+
+# Logs
+logs/
+*.log
+
+# Docker (avoid recursive copy)
+docker/volumes/
+
+# Tests (not needed in production images)
+tests/
+
+# Documentation
+*.md
+LICENSE
+docs/
+
+# Claude Code
+.claude/
+
+# Install script (not needed in container)
+install.sh
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Playwright local artifacts
+playwright-report/
+test-results/

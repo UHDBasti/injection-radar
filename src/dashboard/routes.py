@@ -1,6 +1,7 @@
 """Dashboard routes for InjectionRadar web UI."""
 
 import os
+import secrets
 from datetime import datetime
 from typing import Optional
 
@@ -8,8 +9,10 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import select, func
+from starlette.responses import Response
 
 from ..core.models import Classification
+from ..core.validators import validate_scan_url
 from ..core.database import (
     get_async_session_factory,
     DomainDB,
@@ -24,6 +27,24 @@ templates = Jinja2Templates(
 dashboard_router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 PAGE_SIZE = 25
+
+
+def _get_csrf_token(request: Request, response: Response = None) -> str:
+    """Get or create CSRF token from cookie."""
+    token = request.cookies.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        if response:
+            response.set_cookie(
+                "csrf_token", token, httponly=True, samesite="strict"
+            )
+    return token
+
+
+def _verify_csrf(request: Request, form_token: str) -> bool:
+    """Verify CSRF token from form matches cookie."""
+    cookie_token = request.cookies.get("csrf_token")
+    return bool(cookie_token and cookie_token == form_token)
 
 
 def _get_session_factory():
@@ -123,15 +144,66 @@ async def dashboard_home(request: Request):
 @dashboard_router.get("/scan", response_class=HTMLResponse)
 async def scan_page(request: Request):
     """Scan form page."""
-    return templates.TemplateResponse("scan.html", {
+    response = templates.TemplateResponse("scan.html", {
         "request": request,
         "result": None,
+        "csrf_token": "",
+        "error_message": None,
     })
+    token = _get_csrf_token(request, response)
+    # Re-render with the actual token in context
+    response = templates.TemplateResponse("scan.html", {
+        "request": request,
+        "result": None,
+        "csrf_token": token,
+        "error_message": None,
+    })
+    # Ensure the cookie is set if it was newly generated
+    if not request.cookies.get("csrf_token"):
+        response.set_cookie(
+            "csrf_token", token, httponly=True, samesite="strict"
+        )
+    return response
 
 
 @dashboard_router.post("/scan", response_class=HTMLResponse)
-async def scan_submit(request: Request, url: str = Form(...)):
+async def scan_submit(
+    request: Request,
+    url: str = Form(...),
+    csrf_token: str = Form(""),
+):
     """Trigger a scan and return result partial via HTMX."""
+    # CSRF verification
+    if not _verify_csrf(request, csrf_token):
+        return HTMLResponse(
+            content="<p><strong>Error 403:</strong> CSRF token validation failed. "
+            "Please reload the page and try again.</p>",
+            status_code=403,
+        )
+
+    # Server-side URL validation (scheme + SSRF check)
+    try:
+        validate_scan_url(url)
+    except ValueError as e:
+        return templates.TemplateResponse("partials/scan_result.html", {
+            "request": request,
+            "result": {
+                "url": url,
+                "status": "failed",
+                "classification": None,
+                "confidence": None,
+                "severity_score": None,
+                "flags_count": None,
+                "flags": None,
+                "llm_provider": None,
+                "llm_model": None,
+                "tokens_input": 0,
+                "tokens_output": 0,
+                "processing_time_ms": None,
+                "error_message": f"Invalid URL: {e}",
+            },
+        })
+
     from ..api.main import job_queue, SessionFactory, _calculate_confidence, _save_scan_results
     from ..core.config import get_settings
 

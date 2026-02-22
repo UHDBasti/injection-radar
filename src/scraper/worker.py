@@ -25,6 +25,7 @@ from playwright.async_api import async_playwright, Page, Browser
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..core.config import get_settings
+from ..core.validators import is_internal_url
 from ..core.models import ScrapedContent, ScanResult, RedFlag, RedFlagType, Severity
 from ..core.database import (
     ScrapedContentDB,
@@ -44,6 +45,28 @@ from .stealth import get_random_user_agent, apply_stealth, is_bot_protection_pag
 
 # Graceful shutdown flag
 _shutdown_requested = False
+
+
+def _sanitize_evidence(text: str, max_length: int = 200) -> str:
+    """Truncate and clean evidence text before crossing security boundary."""
+    if not text:
+        return ""
+    import html as html_mod
+    text = re.sub(r'<[^>]+>', '', text)
+    text = html_mod.escape(text)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    if len(text) > max_length:
+        text = text[:max_length] + "..."
+    return text
+
+
+def _classify_severity(severity_score: float) -> str:
+    """Consistent classification across all scan modes."""
+    if severity_score >= 6.0:
+        return "dangerous"
+    elif severity_score > 0:
+        return "suspicious"
+    return "safe"
 
 
 async def get_or_create_url(session: AsyncSession, url: str) -> int:
@@ -125,6 +148,11 @@ class ScraperWorker:
         Returns:
             ScrapedContent mit allen extrahierten Daten.
         """
+        # SSRF protection: block internal/private URLs
+        is_blocked, reason = is_internal_url(url)
+        if is_blocked:
+            raise ValueError(f"URL blocked by SSRF protection: {reason}")
+
         # Tier 1: Playwright
         content = None
         try:
@@ -775,14 +803,7 @@ async def worker_main():
                             )
 
                             # Classification ableiten
-                            if severity_score >= 6.0:
-                                classification = "dangerous"
-                            elif severity_score >= 3.0:
-                                classification = "suspicious"
-                            elif severity_score > 0:
-                                classification = "suspicious"
-                            else:
-                                classification = "safe"
+                            classification = _classify_severity(severity_score)
 
                             # JobResult erstellen (NUR strukturierte Daten!)
                             result = JobResult(
@@ -796,8 +817,8 @@ async def worker_main():
                                     {
                                         "type": flag.type.value,
                                         "severity": flag.severity.value,
-                                        "description": flag.description,
-                                        "evidence": flag.evidence,
+                                        "description": _sanitize_evidence(flag.description),
+                                        "evidence": _sanitize_evidence(flag.evidence),
                                     }
                                     for flag in scan_result.flags_detected
                                 ],
@@ -887,12 +908,7 @@ async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
             scan_result.flags_detected
         )
 
-        if severity_score >= 6.0:
-            classification = "dangerous"
-        elif severity_score >= 3.0:
-            classification = "suspicious"
-        else:
-            classification = "safe"
+        classification = _classify_severity(severity_score)
 
         return JobResult(
             job_id="local-scan",
@@ -905,8 +921,8 @@ async def run_single_scan(url: str, queue: JobQueue) -> JobResult:
                 {
                     "type": flag.type.value,
                     "severity": flag.severity.value,
-                    "description": flag.description,
-                    "evidence": flag.evidence,
+                    "description": _sanitize_evidence(flag.description),
+                    "evidence": _sanitize_evidence(flag.evidence),
                 }
                 for flag in scan_result.flags_detected
             ],

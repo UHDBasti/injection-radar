@@ -5,8 +5,11 @@ Analysiert LLM-Outputs UND Website-Content auf Anzeichen von Prompt Injection.
 """
 
 import base64
+import html as html_module
 import re
+import unicodedata
 from typing import Optional
+from urllib.parse import unquote
 
 from ..core.models import RedFlag, RedFlagType, Severity
 
@@ -279,6 +282,39 @@ class RedFlagDetector:
         r"clip\s*:\s*rect\s*\(\s*0",
     ]
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """Normalize text to prevent Unicode bypass attacks."""
+        # NFKC normalization (converts fullwidth, compatibility chars to standard forms)
+        text = unicodedata.normalize("NFKC", text)
+        # Remove zero-width characters
+        text = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\ufeff\u2060\u2061\u2062\u2063\u2064]', '', text)
+        # Remove other invisible formatting characters
+        text = re.sub(r'[\u00ad\u034f\u115f\u1160\u17b4\u17b5\u180e]', '', text)
+        # Remove RTL/LTR override characters
+        text = re.sub(r'[\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069]', '', text)
+        return text
+
+    @staticmethod
+    def _decode_text(text: str) -> str:
+        """Decode URL-encoded and HTML entity sequences."""
+        decoded = unquote(text)
+        decoded = html_module.unescape(decoded)
+        return decoded
+
+    @staticmethod
+    def _detect_rtl_overrides(original_text: str) -> Optional[RedFlag]:
+        """Detect RTL/LTR override characters before normalization strips them."""
+        rtl_chars = re.findall(r'[\u202a-\u202e\u2066-\u2069]', original_text)
+        if rtl_chars:
+            return RedFlag(
+                type=RedFlagType.FORMAT_DEVIATION,
+                severity=Severity.HIGH,
+                description=f"RTL/LTR override characters detected ({len(rtl_chars)} found) - possible text direction attack",
+                evidence=f"Found {len(rtl_chars)} directional override characters",
+            )
+        return None
+
     def detect_content_injection(
         self,
         extracted_text: str,
@@ -297,54 +333,81 @@ class RedFlagDetector:
             Liste der erkannten RedFlags.
         """
         flags = []
-        text_lower = extracted_text.lower()
+
+        # RTL override detection BEFORE normalization (normalization strips them)
+        rtl_flag = self._detect_rtl_overrides(extracted_text)
+        if rtl_flag:
+            flags.append(rtl_flag)
+
+        # Unicode normalization before pattern matching
+        text_normalized = self._normalize_text(extracted_text)
+
+        # Additionally decode URL-encoding and HTML entities
+        text_decoded = self._decode_text(text_normalized)
+
+        # Collect texts to run pattern matching against
+        texts_to_check = [text_normalized]
+        if text_decoded != text_normalized:
+            texts_to_check.append(text_decoded)
 
         # a) Direkte Injection-Anweisungen (HIGH)
-        injection_flags = self._detect_patterns(
-            extracted_text,
-            self.CONTENT_INJECTION_PATTERNS,
-            RedFlagType.CONTENT_INJECTION,
-            Severity.HIGH,
-            "Injection instructions found in website content",
-        )
-        flags.extend(injection_flags)
+        for text_variant in texts_to_check:
+            injection_flags = self._detect_patterns(
+                text_variant,
+                self.CONTENT_INJECTION_PATTERNS,
+                RedFlagType.CONTENT_INJECTION,
+                Severity.HIGH,
+                "Injection instructions found in website content",
+            )
+            if injection_flags:
+                flags.extend(injection_flags)
+                break
 
         # b) Fake System/Role Tags (HIGH)
-        system_tag_flags = self._detect_patterns(
-            extracted_text,
-            self.FAKE_SYSTEM_TAG_PATTERNS,
-            RedFlagType.CONTENT_INJECTION,
-            Severity.HIGH,
-            "Fake system/role tags found in website content",
-        )
-        flags.extend(system_tag_flags)
+        for text_variant in texts_to_check:
+            system_tag_flags = self._detect_patterns(
+                text_variant,
+                self.FAKE_SYSTEM_TAG_PATTERNS,
+                RedFlagType.CONTENT_INJECTION,
+                Severity.HIGH,
+                "Fake system/role tags found in website content",
+            )
+            if system_tag_flags:
+                flags.extend(system_tag_flags)
+                break
 
         # c) Exfiltration Patterns (CRITICAL)
-        exfil_flags = self._detect_patterns(
-            extracted_text,
-            self.EXFILTRATION_PATTERNS,
-            RedFlagType.CONTENT_INJECTION,
-            Severity.CRITICAL,
-            "Data exfiltration pattern found in website content",
-        )
-        flags.extend(exfil_flags)
+        for text_variant in texts_to_check:
+            exfil_flags = self._detect_patterns(
+                text_variant,
+                self.EXFILTRATION_PATTERNS,
+                RedFlagType.CONTENT_INJECTION,
+                Severity.CRITICAL,
+                "Data exfiltration pattern found in website content",
+            )
+            if exfil_flags:
+                flags.extend(exfil_flags)
+                break
 
         # d) Jailbreak Patterns (HIGH)
-        jailbreak_flags = self._detect_patterns(
-            extracted_text,
-            self.JAILBREAK_PATTERNS,
-            RedFlagType.CONTENT_INJECTION,
-            Severity.HIGH,
-            "Jailbreak pattern found in website content",
-        )
-        flags.extend(jailbreak_flags)
+        for text_variant in texts_to_check:
+            jailbreak_flags = self._detect_patterns(
+                text_variant,
+                self.JAILBREAK_PATTERNS,
+                RedFlagType.CONTENT_INJECTION,
+                Severity.HIGH,
+                "Jailbreak pattern found in website content",
+            )
+            if jailbreak_flags:
+                flags.extend(jailbreak_flags)
+                break
 
         # e) Hidden Text Detection (CRITICAL) - benötigt raw HTML
         if raw_html:
             hidden_flags = self._detect_hidden_text(raw_html)
             flags.extend(hidden_flags)
 
-        # f) Obfuscation Detection
+        # f) Obfuscation Detection (use original text for zero-width detection)
         obfuscation_flags = self._detect_obfuscation(extracted_text)
         flags.extend(obfuscation_flags)
 
@@ -450,21 +513,26 @@ class RedFlagDetector:
                 continue
 
         # Zero-width characters (oft für Obfuskierung genutzt)
-        zero_width_chars = [
-            "\u200b",  # Zero-width space
-            "\u200c",  # Zero-width non-joiner
-            "\u200d",  # Zero-width joiner
-            "\u2060",  # Word joiner
-            "\ufeff",  # Zero-width no-break space
-        ]
-        zw_count = sum(text.count(c) for c in zero_width_chars)
-        if zw_count > 10:
-            flags.append(RedFlag(
-                type=RedFlagType.CONTENT_INJECTION,
-                severity=Severity.MEDIUM,
-                description="Excessive zero-width characters detected (possible obfuscation)",
-                evidence=f"Found {zw_count} zero-width characters",
-            ))
+        zw_pattern = r'[\u200b\u200c\u200d\u2060\ufeff]'
+        zw_count = len(re.findall(zw_pattern, text))
+        if zw_count > 0:
+            # Check if zero-width chars appear inside words (HIGH severity)
+            # Pattern: a word character, then zero-width char(s), then another word character
+            zw_inside_words = re.findall(r'\w[\u200b\u200c\u200d\u2060\ufeff]+\w', text)
+            if zw_inside_words:
+                flags.append(RedFlag(
+                    type=RedFlagType.CONTENT_INJECTION,
+                    severity=Severity.HIGH,
+                    description="Zero-width characters inside words detected (obfuscation attack)",
+                    evidence=f"Found {len(zw_inside_words)} words with embedded zero-width chars, {zw_count} total",
+                ))
+            else:
+                flags.append(RedFlag(
+                    type=RedFlagType.CONTENT_INJECTION,
+                    severity=Severity.MEDIUM,
+                    description="Zero-width characters detected (possible obfuscation)",
+                    evidence=f"Found {zw_count} zero-width characters",
+                ))
 
         return flags
 
@@ -490,6 +558,22 @@ class RedFlagDetector:
         """
         flags = []
 
+        # RTL override detection BEFORE normalization
+        rtl_flag = self._detect_rtl_overrides(llm_output)
+        if rtl_flag:
+            flags.append(rtl_flag)
+
+        # Unicode normalization before pattern matching
+        llm_output_normalized = self._normalize_text(llm_output)
+
+        # Additionally decode URL-encoding and HTML entities
+        llm_output_decoded = self._decode_text(llm_output_normalized)
+
+        # Collect texts to run pattern matching against
+        texts_to_check = [llm_output_normalized]
+        if llm_output_decoded != llm_output_normalized:
+            texts_to_check.append(llm_output_decoded)
+
         # Tool Calls (CRITICAL)
         if tool_calls:
             flags.append(RedFlag(
@@ -500,73 +584,88 @@ class RedFlagDetector:
             ))
 
         # Implizite Tool-Call-Versuche im Text
-        tool_text_flags = self._detect_patterns(
-            llm_output,
-            self.TOOL_CALL_PATTERNS,
-            RedFlagType.TOOL_CALL,
-            Severity.CRITICAL,
-            "Tool call attempt detected in output text",
-        )
-        flags.extend(tool_text_flags)
+        for text_variant in texts_to_check:
+            tool_text_flags = self._detect_patterns(
+                text_variant,
+                self.TOOL_CALL_PATTERNS,
+                RedFlagType.TOOL_CALL,
+                Severity.CRITICAL,
+                "Tool call attempt detected in output text",
+            )
+            if tool_text_flags:
+                flags.extend(tool_text_flags)
+                break
 
         # Code Execution (CRITICAL)
-        code_flags = self._detect_patterns(
-            llm_output,
-            self.CODE_EXECUTION_PATTERNS,
-            RedFlagType.CODE_EXECUTION,
-            Severity.CRITICAL,
-            "Code execution attempt detected",
-        )
-        flags.extend(code_flags)
+        for text_variant in texts_to_check:
+            code_flags = self._detect_patterns(
+                text_variant,
+                self.CODE_EXECUTION_PATTERNS,
+                RedFlagType.CODE_EXECUTION,
+                Severity.CRITICAL,
+                "Code execution attempt detected",
+            )
+            if code_flags:
+                flags.extend(code_flags)
+                break
 
         # System Prompt Leak (HIGH)
-        system_flags = self._detect_patterns(
-            llm_output,
-            self.SYSTEM_PROMPT_PATTERNS,
-            RedFlagType.SYSTEM_PROMPT_LEAK,
-            Severity.HIGH,
-            "Possible system prompt leak detected",
-        )
-        flags.extend(system_flags)
+        for text_variant in texts_to_check:
+            system_flags = self._detect_patterns(
+                text_variant,
+                self.SYSTEM_PROMPT_PATTERNS,
+                RedFlagType.SYSTEM_PROMPT_LEAK,
+                Severity.HIGH,
+                "Possible system prompt leak detected",
+            )
+            if system_flags:
+                flags.extend(system_flags)
+                break
 
         # Direct Instructions (HIGH)
-        instruction_flags = self._detect_patterns(
-            llm_output,
-            self.INSTRUCTION_PATTERNS,
-            RedFlagType.DIRECT_INSTRUCTIONS,
-            Severity.HIGH,
-            "Direct instruction manipulation detected",
-        )
-        flags.extend(instruction_flags)
+        for text_variant in texts_to_check:
+            instruction_flags = self._detect_patterns(
+                text_variant,
+                self.INSTRUCTION_PATTERNS,
+                RedFlagType.DIRECT_INSTRUCTIONS,
+                Severity.HIGH,
+                "Direct instruction manipulation detected",
+            )
+            if instruction_flags:
+                flags.extend(instruction_flags)
+                break
 
         # External URLs (MEDIUM)
-        url_flags = self._detect_patterns(
-            llm_output,
-            self.EXTERNAL_URL_PATTERNS,
-            RedFlagType.EXTERNAL_URLS,
-            Severity.MEDIUM,
-            "Suspicious external URL detected",
-        )
-        flags.extend(url_flags)
+        for text_variant in texts_to_check:
+            url_flags = self._detect_patterns(
+                text_variant,
+                self.EXTERNAL_URL_PATTERNS,
+                RedFlagType.EXTERNAL_URLS,
+                Severity.MEDIUM,
+                "Suspicious external URL detected",
+            )
+            if url_flags:
+                flags.extend(url_flags)
+                break
 
         # Format Deviation (MEDIUM)
-        format_flag = self._detect_format_deviation(llm_output, expected_format)
+        format_flag = self._detect_format_deviation(llm_output_normalized, expected_format)
         if format_flag:
             flags.append(format_flag)
 
         # Unexpected Data (MEDIUM)
-        unexpected_flag = self._detect_unexpected_data(llm_output)
+        unexpected_flag = self._detect_unexpected_data(llm_output_normalized)
         if unexpected_flag:
             flags.append(unexpected_flag)
 
         # Hallucination Check (LOW) - wenn Original-Content vorhanden
         if original_content:
-            hallucination_flag = self._detect_hallucination(llm_output, original_content)
+            hallucination_flag = self._detect_hallucination(llm_output_normalized, original_content)
             if hallucination_flag:
                 flags.append(hallucination_flag)
 
         # Sentiment Shift (LOW)
-        sentiment_flag = self._detect_sentiment_shift(llm_output)
+        sentiment_flag = self._detect_sentiment_shift(llm_output_normalized)
         if sentiment_flag:
             flags.append(sentiment_flag)
 

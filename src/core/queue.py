@@ -7,16 +7,45 @@ Ermöglicht sichere Kommunikation zwischen Orchestrator und Scraper-Subsystem:
 - Ergebnisse werden via Redis zurückgegeben (nur ScanResult, keine Rohdaten!)
 """
 
+import html
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from dataclasses import dataclass, asdict
 
 import redis.asyncio as redis
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from .logging import log_info, log_error, log_debug
+
+
+# ============================================================================
+# Security Boundary Sanitization
+# ============================================================================
+
+def _sanitize_boundary_text(text: str, max_length: int = 1000) -> str:
+    """Sanitize text crossing the security boundary.
+
+    Strips HTML/JS, control characters, and truncates to max length.
+    This prevents attacker-influenced content from the scraper subsystem
+    from injecting HTML, scripts, or invisible characters into the orchestrator.
+    """
+    if not text:
+        return ""
+    # Strip HTML tags
+    text = re.sub(r'<[^>]+>', '', text)
+    # HTML-escape remaining content
+    text = html.escape(text)
+    # Remove control characters (except newline, tab)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Remove zero-width characters
+    text = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\u2028\u2029\ufeff]', '', text)
+    # Truncate
+    if len(text) > max_length:
+        text = text[:max_length] + "... [truncated]"
+    return text
 
 
 # ============================================================================
@@ -66,6 +95,24 @@ class JobResult(BaseModel):
 
     # Fehler (falls status="failed")
     error_message: Optional[str] = None
+
+    @model_validator(mode="after")
+    def sanitize_boundary_fields(self) -> "JobResult":
+        """Sanitize fields that cross the security boundary from scraper to orchestrator.
+
+        The llm_summary and flag evidence/descriptions carry attacker-influenced
+        content from scraped websites. Sanitize to prevent injection attacks.
+        """
+        if self.llm_summary:
+            self.llm_summary = _sanitize_boundary_text(self.llm_summary)
+        if self.flags:
+            for flag in self.flags:
+                if isinstance(flag, dict):
+                    if "evidence" in flag and flag["evidence"]:
+                        flag["evidence"] = _sanitize_boundary_text(flag["evidence"], max_length=200)
+                    if "description" in flag and flag["description"]:
+                        flag["description"] = _sanitize_boundary_text(flag["description"], max_length=500)
+        return self
 
 
 # ============================================================================
