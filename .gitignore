@@ -33,7 +33,6 @@ pip-log.txt
 pip-delete-this-directory.txt
 
 # Unit test / coverage reports
-tests/
 htmlcov/
 .tox/
 .nox/
@@ -132,7 +131,9 @@ api_keys.json
 secrets.json
 
 # Large data files
-data/
+data/*.db
+data/*.sqlite
+data/exports/
 
 # Docker volumes
 docker/volumes/

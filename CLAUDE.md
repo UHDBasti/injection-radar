@@ -1,284 +1,143 @@
-# InjectionRadar - Claude Code Projektdokumentation
+# InjectionRadar - Projektdokumentation
 
-> **Für Claude Code:** Diese Datei enthält alle wichtigen Informationen über das Projekt.
-> Lies sie vollständig, bevor du Code schreibst oder änderst.
+> **Stand:** 15. April 2026
+> **Phase:** Research-First MVP
+> **Sprache:** Antworten IMMER auf Deutsch. Englische Fachbegriffe beim ersten Mal kurz erklären.
 
 ---
 
-## 🎯 Projektübersicht
+## Projektbeschreibung
 
-**InjectionRadar** ist ein System zur automatischen Erkennung von Prompt Injection in Web-Inhalten. Es funktioniert wie ein "Virenscanner für AI-Agents" – testet Websites proaktiv und katalogisiert gefährliche Quellen.
+**InjectionRadar** ist eine proaktive Datenbank/Blacklist von Websites die Prompt Injection enthalten — "Google Safe Browsing für AI-Agents". Websites werden automatisch gescraped und mit LLMs auf Prompt Injection getestet. Ergebnisse werden katalogisiert und als API/Feed bereitgestellt.
 
-### Kernkonzept
+---
+
+## Strategiewechsel (April 2026)
+
+**Alt (verworfen):** Vollständiges Zwei-System-Design mit Docker-Sandbox-Pool, PostgreSQL, Redis, Multi-LLM. Ergebnis: 2 Monate Architektur ohne funktionierenden Prototyp.
+
+**Neu (aktiv):** Research-First MVP. Minimaler Scanner. Kein Docker, keine Sandboxes. Einfaches Python-Script das Websites scraped, analysiert und Ergebnisse speichert. Ziel: In 4-6 Wochen einen veröffentlichbaren Research-Beitrag mit echten Daten.
+
+---
+
+## MVP-Architektur
+
 ```
-Website → Scraper (Docker) → Test-LLM → Red-Flag Detection → Klassifizierung → Datenbank
+[Tranco .de-Domains CSV]
+         |
+         v
+[scanner.py] ──── scrapt URL (httpx)
+         |
+         v
+[detector.py] ── Pattern-basierte Analyse (lokal, kostenlos)
+         |
+         v  (nur wenn Pattern unsicher)
+[llm_analyzer.py] ── GPT-4o-mini Analyse (~$0.003/URL)
+         |
+         v
+[SQLite DB] + [JSON/CSV Export]
 ```
 
 ---
 
-## ⚠️ KRITISCHE SICHERHEITSARCHITEKTUR
-
-**WICHTIG:** Das System hat ein Zwei-System-Design aus Sicherheitsgründen:
-
-### Hauptsystem (Orchestrator)
-- **DARF NIEMALS** gescrapte Rohdaten (HTML, Text) verarbeiten
-- Sieht **NUR** strukturierte Reports vom Subsystem
-- Kommuniziert via Redis Queue mit dem Subsystem
-- Speichert Klassifizierungen in der Datenbank
-
-### Subsystem (Scraper in Docker)
-- Läuft in isolierten Docker-Containern (read-only, no-new-privileges)
-- Scraped Websites mit Playwright und führt LLM-Tests durch
-- Speichert Rohdaten **DIREKT** in die Datenbank
-- Gibt nur `JobResult` (strukturierter Report) ans Hauptsystem zurück
-
-**Grund:** Wenn das Hauptsystem Rohdaten verarbeiten würde, könnte es selbst Opfer von Prompt Injection werden!
-
----
-
-## 📁 Projektstruktur
+## Projektstruktur (MVP)
 
 ```
 injection-radar/
-├── CLAUDE.md              # Diese Datei (für Claude Code)
+├── CLAUDE.md              # Diese Datei
 ├── README.md              # Projekt-Dokumentation
-├── pyproject.toml         # Python Package Config
-├── requirements.txt       # Python Dependencies
-├── .env                   # API Keys (nicht committen!)
-│
-├── docker/
-│   ├── docker-compose.yml     # Komplettes Docker Setup
-│   ├── Dockerfile.orchestrator
-│   └── Dockerfile.scraper
-│
+├── pyproject.toml         # MVP Dependencies
+├── .env.example           # API-Key Template
+├── .gitignore
+├── LICENSE                # MIT
+├── top-1m.csv             # Tranco Top-1M (nicht in Git)
+├── data/
+│   └── de-domains.csv     # Gefilterte .de-Domains
 ├── src/
-│   ├── core/                  # Kernlogik
-│   │   ├── models.py          # Pydantic Datenmodelle
-│   │   ├── config.py          # Konfigurationsmanagement
-│   │   ├── database.py        # SQLAlchemy Models
-│   │   ├── queue.py           # Redis Job Queue
-│   │   ├── logging.py         # Strukturiertes Logging
-│   │   └── startup.py         # Docker Service Management
-│   │
-│   ├── scraper/               # Web-Scraping (Subsystem)
-│   │   └── worker.py          # Playwright Scraper Worker
-│   │
-│   ├── llm/                   # LLM-Provider
-│   │   ├── base.py            # Base-Klasse
-│   │   ├── anthropic.py       # Claude Integration
-│   │   └── openai.py          # OpenAI Integration
-│   │
-│   ├── analysis/              # Red-Flag Detection
-│   │   └── detector.py        # Pattern-Analyse
-│   │
-│   ├── cli/                   # Command Line Interface
-│   │   ├── main.py            # Typer CLI
-│   │   └── interactive.py     # Interaktive Shell
-│   │
-│   ├── api/                   # REST API (Orchestrator)
-│   │   └── main.py            # FastAPI Server
-│   │
-│   └── mcp/                   # MCP Server für AI-Tools
-│       └── server.py          # MCP Integration
-│
-└── tests/                     # Tests
+│   ├── scanner.py         # Haupt-Script: URL -> Scrape -> Analyse -> Ergebnis
+│   ├── scraper.py         # httpx-basiertes Scraping
+│   ├── detector.py        # Pattern-basierte Red-Flag Detection (EXISTIERT)
+│   ├── llm_analyzer.py    # GPT-4o-mini Analyse
+│   ├── models.py          # Pydantic Models (vereinfacht)
+│   └── db.py              # SQLite Storage
+├── results/               # Scan-Ergebnisse (JSON/CSV)
+└── tests/
+    └── test_detector.py   # Detector Tests (EXISTIERT)
+```
+
+### Bestehender Code (aus Architektur-Phase)
+
+Der alte Code unter `src/core/`, `src/analysis/`, `src/llm/`, `src/scraper/`, `src/cli/`, `src/api/`, `src/mcp/`, `src/dashboard/`, `src/scheduler/` bleibt vorerst erhalten. Daraus wird selektiv Code für den MVP extrahiert:
+
+| Quelle | Zeilen | MVP-Nutzung |
+|--------|--------|-------------|
+| `src/analysis/detector.py` | 905 | DIREKT ÜBERNEHMEN — Kern der Detection |
+| `src/core/models.py` | 217 | Vereinfachen, Enums + RedFlag übernehmen |
+| `src/llm/openai.py` | 135 | ÜBERNEHMEN für GPT-4o-mini |
+| `src/llm/base.py` | 164 | LLMResult übernehmen |
+| `src/scraper/worker.py` | 943 | Extraktionslogik portieren (httpx statt Playwright) |
+| `tests/test_detector.py` | 257 | ÜBERNEHMEN |
+
+Alles andere (Docker, Redis, PostgreSQL, FastAPI, Interactive CLI, MCP) ist Ballast für den MVP und wird erst nach Validierung wieder aktiviert.
+
+---
+
+## Tech-Stack MVP
+
+```
+python >= 3.11
+httpx              # Async HTTP Client
+beautifulsoup4     # HTML Parsing
+lxml               # Fast HTML Parser
+pydantic           # Datenvalidierung
+openai             # GPT-4o-mini API
+rich               # CLI Output
+python-dotenv      # .env laden
+sqlite3            # Datenbank (built-in)
 ```
 
 ---
 
-## 🚀 Verwendung
+## Session-Plan
 
-### Starten
-```bash
-# Interaktive Shell (startet automatisch Docker Services)
-injection-radar
-
-# Oder direkt mit Typer CLI
-injection-radar scan https://example.com
-```
-
-### CLI-Befehle
-| Befehl | Beschreibung |
-|--------|--------------|
-| `scan <url>` | Scannt eine URL |
-| `scan <url1> <url2> ...` | Scannt mehrere URLs parallel (max 10) |
-| `scan list <file.csv>` | Scannt URLs aus einer CSV-Datei |
-| `scan <url> --local` | Lokaler Scan ohne Docker |
-| `scan <url> --quick` | Schneller Pattern-Scan ohne LLM |
-| `history [n]` | Zeigt die letzten n Scans |
-| `status` | Zeigt den aktuellen Status |
-| `services` | Zeigt Docker-Service-Status |
-| `config` | Öffnet den Konfigurations-Wizard |
-
-### API Endpoints
-| Endpoint | Methode | Beschreibung |
-|----------|---------|--------------|
-| `/scan` | POST | Scannt eine URL |
-| `/history` | GET | Scan-Historie |
-| `/url/status` | GET | Status einer URL |
-| `/domains/dangerous` | GET | Gefährliche Domains |
-| `/health` | GET | Health Check |
+| # | Session | Status | Beschreibung |
+|---|---------|--------|--------------|
+| 1 | Projekt-Setup | IN ARBEIT | Bereinigung, .de-Domains filtern, Dependencies verschlanken |
+| 2 | Scraper bauen | OFFEN | httpx-basiertes Scraping mit Text-Extraktion |
+| 3 | Detection-Engine | OFFEN | detector.py übernehmen + llm_analyzer.py bauen |
+| 4 | Pipeline | OFFEN | scanner.py + SQLite + erster Testlauf (100 URLs) |
+| 5 | Erster Scan | OFFEN | 1.000 .de-Domains scannen, Ergebnisse analysieren |
+| 6 | VPS + Skalierung | OFFEN | Hetzner VPS, 10.000 Domains scannen |
+| 7 | Veröffentlichung | OFFEN | README, GitHub public, Blog-Post Outline |
 
 ---
 
-## 🔧 Wichtige Datenmodelle
+## Sicherheitsregeln
 
-### `JobResult` - Report vom Subsystem
-```python
-class JobResult(BaseModel):
-    """Ergebnis eines Scan-Jobs (nur strukturierte Daten!)."""
-    job_id: str
-    url: str
-    status: str  # "completed", "failed", "timeout"
-    severity_score: float
-    flags_count: int
-    flags: list[dict]
-    classification: str  # "safe", "suspicious", "dangerous"
-    llm_provider: str
-    llm_model: str
-    processing_time_ms: int
-```
-
-### `Classification` - Ergebnis
-```python
-class Classification(str, Enum):
-    SAFE = "safe"           # ✅ Keine Probleme erkannt
-    SUSPICIOUS = "suspicious"  # ⚠️ Verdächtig, nicht eindeutig
-    DANGEROUS = "dangerous"    # 🚨 Klare Prompt Injection
-    ERROR = "error"         # ❌ Scan fehlgeschlagen
-    PENDING = "pending"     # ⏳ Noch nicht gescannt
-```
-
-### `RedFlagType` - Erkannte Probleme
-```python
-class RedFlagType(str, Enum):
-    TOOL_CALL = "tool_call"              # 🔴 CRITICAL
-    CODE_EXECUTION = "code_execution"    # 🔴 CRITICAL
-    SYSTEM_PROMPT_LEAK = "system_prompt_leak"  # 🟠 HIGH
-    DIRECT_INSTRUCTIONS = "direct_instructions"  # 🟠 HIGH
-    FORMAT_DEVIATION = "format_deviation"  # 🟡 MEDIUM
-    EXTERNAL_URLS = "external_urls"      # 🟡 MEDIUM
-    HALLUCINATION = "hallucination"      # 🔵 LOW
-    SENTIMENT_SHIFT = "sentiment_shift"  # 🔵 LOW
-```
+1. **NIEMALS** API-Keys in Code oder Commits (.env ist in .gitignore)
+2. **NIEMALS** top-1m.csv committen (22 MB, in .gitignore)
+3. **IMMER** Input validieren (Pydantic)
+4. **IMMER** Rate-Limiting beim Scraping beachten
 
 ---
 
-## 🐳 Docker Services
+## Code-Konventionen
 
-```bash
-# Services werden automatisch beim Start von injection-radar gestartet
-
-# Manuell starten
-cd docker && docker compose up -d
-
-# Logs anzeigen
-docker compose logs -f orchestrator
-
-# Status prüfen
-docker compose ps
-
-# Alles stoppen
-docker compose down
-
-# Volumes löschen (Datenbank reset)
-docker compose down -v
-```
-
-### Container
-| Container | Port | Beschreibung |
-|-----------|------|--------------|
-| pishield-db | 5432 | PostgreSQL Datenbank |
-| pishield-redis | 6379 | Redis Job Queue |
-| pishield-orchestrator | 8000 | FastAPI Orchestrator |
-| docker-scraper-1/2 | - | Playwright Scraper Workers |
-
----
-
-## 📊 Datenbank
-
-### Wichtige Tabellen
-- `domains` - Aggregierte Domain-Statistiken
-- `urls` - Einzelne URLs mit Status
-- `scraped_content` - Rohdaten (nur Subsystem!)
-- `scan_results` - Strukturierte Reports
-- `analysis_results` - Finale Klassifizierungen
-
-### Direkter Zugriff
-```bash
-docker exec -it pishield-db psql -U pishield -d pishield
-```
-
----
-
-## 🔐 Sicherheitsregeln
-
-1. **NIEMALS** API-Keys in Code oder Commits
-2. **NIEMALS** Rohdaten im Hauptsystem verarbeiten
-3. **IMMER** strukturierte Reports verwenden
-4. **IMMER** Input validieren (Pydantic)
-5. **IMMER** Sandbox-Container isoliert halten
-6. **IMMER** `datetime.utcnow()` für DB-Timestamps (nicht timezone-aware!)
-
----
-
-## 📝 Code-Konventionen
-
-### Python Style
-- Python 3.11+
-- Type Hints überall
+- Python 3.11+, Type Hints
 - Pydantic für Datenvalidierung
-- async/await für I/O-Operationen
-- Docstrings im Google-Style
-
-### Naming
-- Dateien: `snake_case.py`
-- Klassen: `PascalCase`
-- Funktionen/Variablen: `snake_case`
-- Konstanten: `UPPER_SNAKE_CASE`
-
-### Bekannte Fallstricke
-- PostgreSQL `TIMESTAMP WITHOUT TIME ZONE` braucht naive datetimes (`datetime.utcnow()`)
-- `dict.get(key, default)` gibt default nur zurück wenn key nicht existiert, nicht wenn value `None` ist
-- Nutze `value = result.get("key") or []` statt `result.get("key", [])`
+- async/await für I/O
+- Dateien: `snake_case.py`, Klassen: `PascalCase`
+- Kein Over-Engineering: Einfachste Lösung zuerst
+- Code sauber ohne Inline-Kommentare
 
 ---
 
-## 🎯 Aktueller Status
+## Kosten MVP
 
-**Phase:** Funktionsfähiger Prototyp
-
-**Erledigt:**
-- [x] Zwei-System-Architektur mit Docker
-- [x] Redis Job Queue
-- [x] Playwright Scraper in Sandbox
-- [x] LLM Integration (Anthropic, OpenAI)
-- [x] Red-Flag Detection
-- [x] Interaktive CLI Shell
-- [x] REST API (FastAPI)
-- [x] Paralleles Scannen (bis zu 10 URLs)
-- [x] CSV Batch Import
-- [x] History Command
-- [x] MCP Server für AI-Tools
-- [x] Automatischer Docker Service Start
-
-**Offen:**
-- [ ] Rate Limiting
-- [ ] Checkpoint-System für große Crawls
-- [ ] Web Dashboard
-- [ ] Scheduled Scans
-
----
-
-## 💡 Für Claude Code
-
-Wenn du an diesem Projekt arbeitest:
-
-1. **Lies immer zuerst** `src/core/models.py` und `src/core/queue.py`
-2. **Beachte die Sicherheitsarchitektur** - Hauptsystem sieht keine Rohdaten!
-3. **Nutze Pydantic** für alle Datenvalidierung
-4. **Schreibe async Code** für I/O-Operationen
-5. **Teste mit Docker** - `docker compose up -d` vor dem Testen
-6. **Nutze naive datetimes** für PostgreSQL (`datetime.utcnow()`)
-
-Bei Fragen zur Architektur: Frag nach, bevor du implementierst!
+| Posten | Kosten |
+|--------|--------|
+| 10.000 URLs scrapen (httpx) | ~0 EUR |
+| Pattern-Detection (lokal) | 0 EUR |
+| ~2.000 URLs LLM-Analyse (GPT-4o-mini) | ~6-10 EUR |
+| VPS Hetzner CX22 | 5 EUR/Monat |
+| **Gesamt** | **~15-20 EUR** |

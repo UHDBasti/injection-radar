@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "injection-radar"
-version = "0.1.0"
-description = "Automatische Erkennung von Prompt Injection in Web-Inhalten"
+version = "0.2.0"
+description = "Proaktive Datenbank von Websites mit Prompt Injection — Google Safe Browsing für AI-Agents"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.11"
 authors = [
-    {name = "InjectionRadar Team"}
+    {name = "Sebastian Kaiser"}
 ]
-keywords = ["security", "llm", "prompt-injection", "web-scraping"]
+keywords = ["security", "llm", "prompt-injection", "web-scraping", "ai-safety"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -24,50 +24,42 @@ classifiers = [
 ]
 
 dependencies = [
-    "pydantic>=2.5.0",
-    "pydantic-settings>=2.1.0",
-    "PyYAML>=6.0.0",
-    "anthropic>=0.18.0",
-    "openai>=1.12.0",
-    "playwright>=1.41.0",
-    "playwright-stealth>=1.0.0",
-    "browserforge>=1.0.0",
+    "httpx>=0.26.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=5.1.0",
-    "httpx>=0.26.0",
-    "sqlalchemy>=2.0.0",
-    "asyncpg>=0.29.0",
-    "aiosqlite>=0.19.0",
-    "alembic>=1.13.0",
-    "fastapi>=0.109.0",
-    "uvicorn>=0.27.0",
-    "typer>=0.9.0",
+    "pydantic>=2.5.0",
+    "openai>=1.12.0",
     "rich>=13.7.0",
-    "tenacity>=8.2.0",
-    "structlog>=24.1.0",
-    "aiofiles>=23.2.0",
-    "redis>=5.0.0",
+    "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0.0"]
+full = [
+    "anthropic>=0.18.0",
+    "playwright>=1.41.0",
+    "playwright-stealth>=1.0.0",
+    "browserforge>=1.0.0",
+    "sqlalchemy>=2.0.0",
+    "asyncpg>=0.29.0",
+    "aiosqlite>=0.19.0",
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "redis>=5.0.0",
+    "typer>=0.9.0",
+    "structlog>=24.1.0",
+    "tenacity>=8.2.0",
+    "aiofiles>=23.2.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=4.1.0",
-    "black>=24.1.0",
     "ruff>=0.2.0",
-    "mypy>=1.8.0",
 ]
 
-[project.scripts]
-injection-radar = "src.cli.main:main"
-injection-radar-mcp = "src.mcp.server:main"
-
 [project.urls]
-Homepage = "https://github.com/yourusername/injection-radar"
-Documentation = "https://github.com/yourusername/injection-radar#readme"
-Repository = "https://github.com/yourusername/injection-radar"
+Homepage = "https://github.com/UHDBasti/injection-radar"
+Repository = "https://github.com/UHDBasti/injection-radar"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -79,19 +71,8 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 
-[tool.black]
-line-length = 88
-target-version = ["py311"]
-include = '\.pyi?$'
-
 [tool.ruff]
 line-length = 88
 target-version = "py311"
 select = ["E", "F", "I", "N", "W"]
 ignore = ["E501"]
-
-[tool.mypy]
-python_version = "3.11"
-warn_return_any = true
-warn_unused_ignores = true
-disallow_untyped_defs = true
